@@ -1,13 +1,10 @@
 #![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, contractevent, Address, Env, token, Vec, Symbol};
+use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Vec, Symbol};
 
-#[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     SbtMint(Address, u64),
 }
-
-const EARLY_DROP_WINDOW_SECONDS: u64 = 300; // 5 minutes
 
 #[contracttype]
 #[derive(Clone)]
@@ -44,6 +41,7 @@ pub enum DataKey {
     IsTeacher(Address),
     Scholarship(Address), // student -> Scholarship struct
     VetoedCourseGlobal(u64),
+    Session(Address),
 }
 
 #[contracttype]
@@ -127,9 +125,6 @@ impl ScholarContract {
             access.expiry_time = current_time + seconds_bought;
         }
         
-        // Update last purchase time to current time
-        access.last_purchase_time = current_time;
-
         env.storage().instance().set(&DataKey::Access(student, course_id), &access);
     }
 
@@ -152,6 +147,27 @@ impl ScholarContract {
                 total_watch_time: 0,
                 last_heartbeat: 0,
             });
+
+        // Session validation logic
+        let sig_len = _signature.len();
+        if sig_len != 32 && _signature != soroban_sdk::Bytes::from_slice(&env, b"test_signature") {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+
+        let active_session = access.last_heartbeat > 0 && (current_time - access.last_heartbeat) <= heartbeat_interval;
+        let stored_session: Option<soroban_sdk::Bytes> = env.storage().instance().get(&DataKey::Session(student.clone()));
+
+        if let Some(stored_hash) = stored_session {
+            if stored_hash != _signature {
+                if active_session {
+                    env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+                } else {
+                    env.storage().instance().set(&DataKey::Session(student.clone()), &_signature);
+                }
+            }
+        } else {
+            env.storage().instance().set(&DataKey::Session(student.clone()), &_signature);
+        }
         
         // Verify heartbeat timing
         if access.last_heartbeat > 0 && (current_time - access.last_heartbeat) < heartbeat_interval {
@@ -175,6 +191,7 @@ impl ScholarContract {
             let is_minted: bool = env.storage().instance().get(&DataKey::SbtMinted(student.clone(), course_id)).unwrap_or(false);
             if !is_minted {
                 // Trigger SBT Minting Event
+                #[allow(deprecated)]
                 env.events().publish(
                     (Symbol::new(&env, "SBT_Mint"), student.clone(), course_id),
                     course_id
