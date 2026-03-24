@@ -190,8 +190,8 @@ fn test_early_drop_immediate_refund() {
     let token_admin = Address::generate(&env);
 
     // Deploy a token for testing
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address);
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
     token_client.mint(&student, &1000);
 
     // Deploy the scholarship contract
@@ -199,14 +199,14 @@ fn test_early_drop_immediate_refund() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     // Initialize the contract with a rate of 10 tokens per second
-    client.init(&10);
+    client.init(&10, &3600, &10, &100, &60);
 
     // Student buys access to course 1 for 100 tokens (10 seconds) at timestamp 0
-    client.buy_access(&student, &1, &100, &token_address);
+    client.buy_access(&student, &1, &100, &token_address.address());
 
     // Verify token balance after purchase
-    assert_eq!(token::Client::new(&env, &token_address).balance(&student), 900);
-    assert_eq!(token::Client::new(&env, &token_address).balance(&contract_id), 100);
+    assert_eq!(token::Client::new(&env, &token_address.address()).balance(&student), 900);
+    assert_eq!(token::Client::new(&env, &token_address.address()).balance(&contract_id), 100);
 
     // Immediately request refund within 5 minutes - at timestamp 1
     env.ledger().set_timestamp(1);
@@ -217,8 +217,8 @@ fn test_early_drop_immediate_refund() {
     assert_eq!(refund_amount, 90);
     
     // Verify tokens were refunded
-    assert_eq!(token::Client::new(&env, &token_address).balance(&student), 990);
-    assert_eq!(token::Client::new(&env, &token_address).balance(&contract_id), 10);
+    assert_eq!(token::Client::new(&env, &token_address.address()).balance(&student), 990);
+    assert_eq!(token::Client::new(&env, &token_address.address()).balance(&contract_id), 10);
 
     // Access should be removed
     assert!(!client.has_access(&student, &1));
@@ -233,8 +233,8 @@ fn test_early_drop_partial_refund() {
     let token_admin = Address::generate(&env);
 
     // Deploy a token for testing
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address);
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
     token_client.mint(&student, &1000);
 
     // Deploy the scholarship contract
@@ -242,10 +242,10 @@ fn test_early_drop_partial_refund() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     // Initialize the contract with a rate of 10 tokens per second
-    client.init(&10);
+    client.init(&10, &3600, &10, &100, &60);
 
     // Student buys access to course 1 for 100 tokens (10 seconds) at timestamp 0
-    client.buy_access(&student, &1, &100, &token_address);
+    client.buy_access(&student, &1, &100, &token_address.address());
 
     // Fast forward 5 seconds, request refund
     env.ledger().set_timestamp(5);
@@ -256,8 +256,8 @@ fn test_early_drop_partial_refund() {
     assert_eq!(refund_amount, 50);
     
     // Verify tokens were refunded
-    assert_eq!(token::Client::new(&env, &token_address).balance(&student), 950);
-    assert_eq!(token::Client::new(&env, &token_address).balance(&contract_id), 50);
+    assert_eq!(token::Client::new(&env, &token_address.address()).balance(&student), 950);
+    assert_eq!(token::Client::new(&env, &token_address.address()).balance(&contract_id), 50);
 }
 
 #[test]
@@ -270,8 +270,8 @@ fn test_no_refund_after_5_minutes() {
     let token_admin = Address::generate(&env);
 
     // Deploy a token for testing
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address);
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
     token_client.mint(&student, &1000);
 
     // Deploy the scholarship contract
@@ -279,10 +279,10 @@ fn test_no_refund_after_5_minutes() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     // Initialize the contract with a rate of 10 tokens per second
-    client.init(&10);
+    client.init(&10, &3600, &10, &100, &60);
 
     // Student buys access to course 1 for 100 tokens (10 seconds) at timestamp 0
-    client.buy_access(&student, &1, &100, &token_address);
+    client.buy_access(&student, &1, &100, &token_address.address());
 
     // Fast forward 6 minutes (360 seconds) - outside the 5 minute window
     env.ledger().set_timestamp(360);
@@ -298,8 +298,8 @@ fn test_refund_resets_last_purchase_time() {
     let token_admin = Address::generate(&env);
 
     // Deploy a token for testing
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address);
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
     token_client.mint(&student, &1000);
 
     // Deploy the scholarship contract
@@ -307,11 +307,11 @@ fn test_refund_resets_last_purchase_time() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     // Initialize the contract with a rate of 10 tokens per second
-    client.init(&10);
+    client.init(&10, &3600, &10, &100, &60);
 
     // Student buys access to course 1 at timestamp 100
     env.ledger().set_timestamp(100);
-    client.buy_access(&student, &1, &100, &token_address);
+    client.buy_access(&student, &1, &100, &token_address.address());
 
     // Fast forward 4 minutes (240 seconds), still within 5 minute window
     env.ledger().set_timestamp(340);
@@ -331,6 +331,9 @@ fn test_refund_resets_last_purchase_time() {
     // Refund = 5 * 10 = 50
     
     assert!(refund_amount >= 0);
+}
+
+#[test]
 fn test_admin_veto() {
     let env = Env::default();
     env.mock_all_auths();
