@@ -16,7 +16,7 @@ fn test_scholarship_flow() {
     // Deploy a token for testing
     let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&student, &1000);
+    token_client.mint(&student, &5000);
 
     // Deploy the scholarship contract
     let contract_id = env.register(ScholarContract, ());
@@ -29,7 +29,7 @@ fn test_scholarship_flow() {
     client.buy_access(&student, &1, &100, &token_address.address());
 
     // Verify token balance
-    assert_eq!(token::Client::new(&env, &token_address.address()).balance(&student), 900);
+    assert_eq!(token::Client::new(&env, &token_address.address()).balance(&student), 4900);
     assert_eq!(token::Client::new(&env, &token_address.address()).balance(&contract_id), 100);
 
     // Verify access
@@ -111,6 +111,43 @@ fn test_dynamic_pricing() {
     let balance_after = token::Client::new(&env, &token_address.address()).balance(&student);
     
     assert_eq!(balance_before - balance_after, 100);
+}
+
+#[test]
+fn test_sbt_minting_trigger() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &5000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_course_duration(&1, &120); // 120 seconds duration
+
+    env.ledger().set_timestamp(100);
+    // Buy access for 2000 tokens -> 200 seconds of access
+    client.buy_access(&student, &1, &2000, &token_address.address());
+
+    client.heartbeat(&student, &1, &soroban_sdk::Bytes::from_slice(&env, b"test_signature"));
+
+    // Simulate 60 seconds watch time
+    env.ledger().set_timestamp(160);
+    client.heartbeat(&student, &1, &soroban_sdk::Bytes::from_slice(&env, b"test_signature"));
+    assert!(!client.is_sbt_minted(&student, &1));
+
+    // Simulate another 60 seconds (total 120)
+    env.ledger().set_timestamp(220);
+    client.heartbeat(&student, &1, &soroban_sdk::Bytes::from_slice(&env, b"test_signature"));
+    
+    // Should be minted now
+    assert!(client.is_sbt_minted(&student, &1));
 }
 
 #[test]

@@ -1,5 +1,11 @@
 #![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Vec};
+use soroban_sdk::{contract, contracttype, contractimpl, contractevent, Address, Env, token, Vec, Symbol};
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Event {
+    SbtMint(Address, u64),
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -22,6 +28,8 @@ pub enum DataKey {
     MinDeposit,
     Subscription(Address),
     HeartbeatInterval,
+    CourseDuration(u64),
+    SbtMinted(Address, u64),
 }
 
 #[contracttype]
@@ -108,6 +116,10 @@ impl ScholarContract {
         env.storage().instance().set(&DataKey::Access(student, course_id), &access);
     }
 
+    pub fn set_course_duration(env: Env, course_id: u64, duration: u64) {
+        env.storage().instance().set(&DataKey::CourseDuration(course_id), &duration);
+    }
+
     pub fn heartbeat(env: Env, student: Address, course_id: u64, _signature: soroban_sdk::Bytes) {
         student.require_auth();
         
@@ -139,8 +151,26 @@ impl ScholarContract {
         if current_time >= access.expiry_time {
             env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
         }
+
+        // SBT Minting Trigger logic
+        let course_duration: u64 = env.storage().instance().get(&DataKey::CourseDuration(course_id)).unwrap_or(0);
+        if course_duration > 0 && access.total_watch_time >= course_duration {
+            let is_minted: bool = env.storage().instance().get(&DataKey::SbtMinted(student.clone(), course_id)).unwrap_or(false);
+            if !is_minted {
+                // Trigger SBT Minting Event
+                env.events().publish(
+                    (Symbol::new(&env, "SBT_Mint"), student.clone(), course_id),
+                    course_id
+                );
+                env.storage().instance().set(&DataKey::SbtMinted(student.clone(), course_id), &true);
+            }
+        }
         
         env.storage().instance().set(&DataKey::Access(student, course_id), &access);
+    }
+
+    pub fn is_sbt_minted(env: Env, student: Address, course_id: u64) -> bool {
+        env.storage().instance().get(&DataKey::SbtMinted(student, course_id)).unwrap_or(false)
     }
 
     pub fn has_access(env: Env, student: Address, course_id: u64) -> bool {
