@@ -143,3 +143,40 @@ fn test_minimum_deposit() {
     );
     assert!(result.is_err());
 }
+
+#[test]
+fn test_admin_veto() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &2000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // 1. Test veto on bought access
+    client.buy_access(&student, &1, &200, &token_address.address());
+    assert!(client.has_access(&student, &1));
+
+    client.veto_course_access(&admin, &student, &1);
+    assert!(!client.has_access(&student, &1));
+
+    // 2. Test veto on subscription access
+    let course_ids = vec![&env, 2, 3];
+    client.buy_subscription(&student, &course_ids, &1, &500, &token_address.address());
+    assert!(client.has_access(&student, &2));
+    assert!(client.has_access(&student, &3));
+
+    client.veto_course_access(&admin, &student, &2);
+    assert!(!client.has_access(&student, &2));
+    assert!(client.has_access(&student, &3)); // Other course in sub should still work
+}
