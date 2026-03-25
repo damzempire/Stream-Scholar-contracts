@@ -37,7 +37,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "i128": "1000"
+                  "i128": "5000"
                 }
               ]
             }
@@ -380,6 +380,21 @@
                       "val": {
                         "i128": "100"
                       }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "Session"
+                          },
+                          {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bytes": "746573745f7369676e6174757265"
+                      }
                     }
                   ]
                 }
@@ -415,7 +430,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "900"
+                      "i128": "4900"
                     }
                   },
                   {

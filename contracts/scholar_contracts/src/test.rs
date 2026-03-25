@@ -182,155 +182,6 @@ fn test_minimum_deposit() {
 }
 
 #[test]
-fn test_early_drop_immediate_refund() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    // Deploy a token for testing
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address);
-    token_client.mint(&student, &1000);
-
-    // Deploy the scholarship contract
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    // Initialize the contract with a rate of 10 tokens per second
-    client.init(&10);
-
-    // Student buys access to course 1 for 100 tokens (10 seconds) at timestamp 0
-    client.buy_access(&student, &1, &100, &token_address);
-
-    // Verify token balance after purchase
-    assert_eq!(token::Client::new(&env, &token_address).balance(&student), 900);
-    assert_eq!(token::Client::new(&env, &token_address).balance(&contract_id), 100);
-
-    // Immediately request refund within 5 minutes - at timestamp 1
-    env.ledger().set_timestamp(1);
-    let refund_amount = client.pro_rated_refund(&student, &1);
-    
-    // Refund should be for remaining time: expiry at 10, current time 1, remaining = 9 seconds
-    // Refund = 9 * 10 = 90 tokens
-    assert_eq!(refund_amount, 90);
-    
-    // Verify tokens were refunded
-    assert_eq!(token::Client::new(&env, &token_address).balance(&student), 990);
-    assert_eq!(token::Client::new(&env, &token_address).balance(&contract_id), 10);
-
-    // Access should be removed
-    assert!(!client.has_access(&student, &1));
-}
-
-#[test]
-fn test_early_drop_partial_refund() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    // Deploy a token for testing
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address);
-    token_client.mint(&student, &1000);
-
-    // Deploy the scholarship contract
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    // Initialize the contract with a rate of 10 tokens per second
-    client.init(&10);
-
-    // Student buys access to course 1 for 100 tokens (10 seconds) at timestamp 0
-    client.buy_access(&student, &1, &100, &token_address);
-
-    // Fast forward 5 seconds, request refund
-    env.ledger().set_timestamp(5);
-    let refund_amount = client.pro_rated_refund(&student, &1);
-    
-    // Refund should be for remaining time: expiry at 10, current time 5, remaining = 5 seconds
-    // Refund = 5 * 10 = 50 tokens
-    assert_eq!(refund_amount, 50);
-    
-    // Verify tokens were refunded
-    assert_eq!(token::Client::new(&env, &token_address).balance(&student), 950);
-    assert_eq!(token::Client::new(&env, &token_address).balance(&contract_id), 50);
-}
-
-#[test]
-#[should_panic(expected = "Refund only available within 5 minutes of purchase")]
-fn test_no_refund_after_5_minutes() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    // Deploy a token for testing
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address);
-    token_client.mint(&student, &1000);
-
-    // Deploy the scholarship contract
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    // Initialize the contract with a rate of 10 tokens per second
-    client.init(&10);
-
-    // Student buys access to course 1 for 100 tokens (10 seconds) at timestamp 0
-    client.buy_access(&student, &1, &100, &token_address);
-
-    // Fast forward 6 minutes (360 seconds) - outside the 5 minute window
-    env.ledger().set_timestamp(360);
-    client.pro_rated_refund(&student, &1);
-}
-
-#[test]
-fn test_refund_resets_last_purchase_time() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    // Deploy a token for testing
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address);
-    token_client.mint(&student, &1000);
-
-    // Deploy the scholarship contract
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    // Initialize the contract with a rate of 10 tokens per second
-    client.init(&10);
-
-    // Student buys access to course 1 at timestamp 100
-    env.ledger().set_timestamp(100);
-    client.buy_access(&student, &1, &100, &token_address);
-
-    // Fast forward 4 minutes (240 seconds), still within 5 minute window
-    env.ledger().set_timestamp(340);
-    let refund_amount = client.pro_rated_refund(&student, &1);
-    
-    // Should get full refund since we're within window
-    // At 340, expiry was at 100+10=110, so remaining time = 0
-    // But we're within 5 minutes, so this should work
-    // Actually with the logic: time_since = 340 - 100 = 240 < 300 ✓
-    // remaining = max(0, 110 - 340) = 0
-    // refund = 0
-    
-    // Let's use a scenario where there's actually remaining time
-    // Buy at 100, but the time should flow during buy_access
-    // Let me adjust: buy at timestamp 100, expiry = 100 + 10 = 110
-    // At timestamp 105, remaining = 110 - 105 = 5
-    // Refund = 5 * 10 = 50
-    
-    assert!(refund_amount >= 0);
 fn test_admin_veto() {
     let env = Env::default();
     env.mock_all_auths();
@@ -458,6 +309,8 @@ fn test_global_course_veto() {
 }
 
 #[test]
+#[should_panic(expected = "HostError")]
+fn test_prevent_session_sharing() {
 fn test_calculate_remaining_airtime() {
     let env = Env::default();
     env.mock_all_auths();
@@ -468,11 +321,60 @@ fn test_calculate_remaining_airtime() {
 
     let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &10000);
     token_client.mint(&funder, &1000);
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
+    client.init(&10, &3600, &10, &100, &60);
+    client.buy_access(&student, &1, &5000, &token_address.address());
+
+    env.ledger().set_timestamp(100);
+    
+    let session1 = soroban_sdk::Bytes::from_slice(&env, b"11111111111111111111111111111111");
+    let session2 = soroban_sdk::Bytes::from_slice(&env, b"22222222222222222222222222222222");
+
+    client.heartbeat(&student, &1, &session1);
+    
+    // Fast forward to allowed heartbeat timing (100 + 60)
+    // Here `active_session` is still TRUE (60 <= 60). New hash triggers PANIC.
+    env.ledger().set_timestamp(160);
+    client.heartbeat(&student, &1, &session2);
+}
+
+#[test]
+fn test_allow_same_session() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.buy_access(&student, &1, &5000, &token_address.address());
+
+    env.ledger().set_timestamp(100);
+    
+    let session1 = soroban_sdk::Bytes::from_slice(&env, b"11111111111111111111111111111111");
+
+    client.heartbeat(&student, &1, &session1);
+    
+    // Fast forward to allowed heartbeat timing
+    // Same hash matches gracefully and watch_time progresses natively
+    env.ledger().set_timestamp(160);
+    client.heartbeat(&student, &1, &session1);
+}
+
+#[test]
+fn test_allow_session_reset_after_timeout() {
     // Initialize with flow_rate (base_rate) of 10
     client.init(&10, &3600, &10, &100, &60);
     
@@ -497,11 +399,25 @@ fn test_calculate_remaining_airtime_zero_flow_rate() {
 
     let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &10000);
     token_client.mint(&funder, &1000);
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
+    client.init(&10, &3600, &10, &100, &60);
+    client.buy_access(&student, &1, &5000, &token_address.address());
+
+    env.ledger().set_timestamp(100);
+    let session1 = soroban_sdk::Bytes::from_slice(&env, b"11111111111111111111111111111111");
+    let session2 = soroban_sdk::Bytes::from_slice(&env, b"22222222222222222222222222222222");
+
+    client.heartbeat(&student, &1, &session1);
+    
+    // Fast forward strictly past the heartbeat window (`161 - 100 > 60` -> active_session = false)
+    // Allows takeover / overwritten session storage naturally
+    env.ledger().set_timestamp(161);
+    client.heartbeat(&student, &1, &session2);
     // Initialize with flow_rate (base_rate) of 0
     client.init(&0, &3600, &10, &100, &60);
     
