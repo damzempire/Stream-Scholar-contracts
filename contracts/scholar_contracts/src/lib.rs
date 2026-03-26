@@ -246,6 +246,14 @@ impl ScholarContract {
         env.storage().persistent().extend_ttl(&DataKey::Access(student, course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
     }
 
+    pub fn get_heartbeat_interval(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::HeartbeatInterval).unwrap_or(60)
+    }
+
+    pub fn get_course_duration(env: Env, course_id: u64) -> u64 {
+        env.storage().persistent().get(&DataKey::CourseDuration(course_id)).unwrap_or(0)
+    }
+
     pub fn get_watch_time(env: Env, student: Address, course_id: u64) -> u64 {
         let access: Access = env.storage().persistent().get(&DataKey::Access(student.clone(), course_id))
             .unwrap_or(Access {
