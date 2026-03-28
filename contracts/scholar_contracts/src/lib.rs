@@ -1,11 +1,18 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
+use core::convert::TryFrom;
+use expiry_math::{checked_access_expiry, checked_subscription_expiry};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec, IntoVal};
 
-// Constants for TTL management and time windows
-const LEDGER_BUMP_THRESHOLD: u32 = 15552000; // ~180 days in ledgers
-const LEDGER_BUMP_EXTEND: u32 = 15552000; // ~180 days in ledgers
+// --- Constants for TTL Management ---
+const LEDGER_BUMP_THRESHOLD: u32 = 123456; // Example threshold
+const LEDGER_BUMP_EXTEND: u32 = 789012;    // Example extension
+const MAX_COURSE_REGISTRY_SIZE: u64 = 1000;
 const EARLY_DROP_WINDOW_SECONDS: u64 = 300; // 5 minutes
 const MAX_COURSE_REGISTRY_SIZE: u64 = 1000; // Maximum number of courses to prevent gas limit issues
+
+// GPA Bonus Constants
+const GPA_BONUS_THRESHOLD: u64 = 35; // 3.5 GPA threshold (stored as 35 to avoid floating point)
+const GPA_BONUS_PERCENTAGE_PER_POINT: u64 = 20; // 2% per 0.1 GPA (20% per 1.0 GPA)
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -32,12 +39,14 @@ pub struct Scholarship {
     pub unlocked_balance: i128,
     pub last_verif: u64,
     pub is_paused: bool,
+    pub is_disputed: bool,
+    pub dispute_reason: Option<Symbol>,
+    pub final_ruling: Option<Symbol>,
 }
 
 #[contracttype]
 pub enum DataKey {
     Access(Address, u64),
-    Price,
     BaseRate,
     DiscountThreshold,
     DiscountPercentage,
@@ -49,7 +58,7 @@ pub enum DataKey {
     Admin,
     VetoedCourse(Address, u64),
     IsTeacher(Address),
-    Scholarship(Address), // student -> Scholarship struct
+    Scholarship(Address),
     VetoedCourseGlobal(u64),
     Session(Address),
     CourseRegistry,
@@ -58,8 +67,26 @@ pub enum DataKey {
     BonusMinutes(Address),
     HasBeenReferred(Address),
     ReferralBonusAmount,
-    RoyaltySplit(u64), // course_id -> RoyaltySplit
+    RoyaltySplit(u64),
     AcademicOracle,
+    // Research Grant Milestone Escrow keys
+    ResearchGrant(Address), // student -> ResearchGrant struct
+    MilestoneClaim(u64), // milestone_id -> MilestoneClaim struct
+    InvoiceHash(u64), // milestone_id -> invoice hash
+    GrantorApproval(u64), // milestone_id -> approval status
+    StreakBonusAmount,
+    ConsecutiveDays(Address, u64), // student, course_id -> StreakData
+    GroupPool(u64), // pool_id -> GroupPool struct
+    GroupPoolMember(u64, Address), // pool_id, member -> contribution amount
+    GroupPoolAccess(u64, Address), // pool_id, member -> access granted
+    ModuleLockConfig(u64, u64), // course_id, module_id -> requires_quiz
+    ModuleQuizLock(Address, u64, u64), // student, course_id, module_id -> QuizProof
+    TuitionStipendSplit(Address), // student -> TuitionStipendSplit struct
+    StudentGPA(Address), // student -> StudentGPA struct
+    // Multi-Sig Academic Board Review Keys
+    DeansCouncil,
+    BoardPauseRequest(Address), // student -> BoardPauseRequest struct
+    BoardSignature(Address, Address), // student, council_member -> signature
 }
 
 #[contracttype]
@@ -92,6 +119,105 @@ pub struct RoyaltySplit {
     pub shares: Vec<(Address, u32)>,
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub struct TuitionStipendSplit {
+    pub university_address: Address,
+    pub student_address: Address,
+    pub university_percentage: u32, // Default 70
+    pub student_percentage: u32,    // Default 30
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StudentGPA {
+    pub student: Address,
+    pub gpa: u64, // Stored as integer (e.g., 3.7 = 37)
+    pub last_updated: u64,
+    pub oracle_verified: bool,
+}
+
+// Multi-Sig Academic Board Review structs
+#[contracttype]
+#[derive(Clone)]
+pub struct DeansCouncil {
+    pub members: Vec<Address>,
+    pub required_signatures: u32, // Default 2 for 2-of-3
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BoardPauseRequest {
+    pub student: Address,
+    pub reason: Symbol,
+    pub requested_at: u64,
+    pub signatures: Vec<Address>,
+    pub is_executed: bool,
+    pub executed_at: Option<u64>,
+}
+
+// Research Grant Milestone Escrow structs
+#[contracttype]
+#[derive(Clone)]
+pub struct ResearchGrant {
+    pub student: Address,
+    pub total_amount: i128,
+    pub token: Address,
+    pub granted_at: u64,
+    pub is_active: bool,
+    pub grantor: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneClaim {
+    pub milestone_id: u64,
+    pub student: Address,
+    pub amount: i128,
+    pub description: Symbol,
+    pub invoice_hash: Option<Symbol>,
+    pub is_approved: bool,
+    pub is_claimed: bool,
+    pub submitted_at: u64,
+    pub approved_at: Option<u64>,
+    pub claimed_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StreakData {
+    pub current_streak: u64,
+    pub last_watch_date: u64,
+    pub total_reward_claimed: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupPool {
+    pub pool_id: u64,
+    pub course_id: u64,
+    pub target_amount: i128,
+    pub current_balance: i128,
+    pub creator: Address,
+    pub token: Address,
+    pub is_active: bool,
+    pub member_count: u64,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct QuizProof {
+    pub student: Address,
+    pub course_id: u64,
+    pub module_id: u64,
+    pub quiz_hash: Symbol,
+    pub score: u64,
+    pub passed_at: u64,
+    pub is_verified: bool,
+}
+
 #[contract]
 pub struct ScholarContract;
 
@@ -118,6 +244,23 @@ impl ScholarContract {
         env.storage()
             .instance()
             .set(&DataKey::HeartbeatInterval, &heartbeat_interval);
+    }
+
+    fn calculate_gpa_bonus(env: Env, student: Address) -> u64 {
+        let gpa_data: Option<StudentGPA> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StudentGPA(student.clone()));
+        
+        if let Some(gpa_info) = gpa_data {
+            if gpa_info.oracle_verified && gpa_info.gpa > GPA_BONUS_THRESHOLD {
+                // Calculate how many 0.1 increments above 3.5
+                let gpa_above_threshold = gpa_info.gpa - GPA_BONUS_THRESHOLD; // e.g., 3.7 - 3.5 = 0.2 = 2
+                let bonus_percentage = (gpa_above_threshold * GPA_BONUS_PERCENTAGE_PER_POINT) / 10; // 2 * 20 / 10 = 4%
+                return bonus_percentage;
+            }
+        }
+        0 // No bonus if GPA <= 3.5 or not verified
     }
 
     fn calculate_dynamic_rate(env: Env, student: Address, course_id: u64) -> i128 {
@@ -151,42 +294,54 @@ impl ScholarContract {
                 last_purchase_time: 0,
             });
 
-        if access.total_watch_time >= discount_threshold {
+        // Start with base rate and apply watch time discount
+        let mut rate = if access.total_watch_time >= discount_threshold {
             let discount = (base_rate * discount_percentage as i128) / 100;
             base_rate - discount
         } else {
             base_rate
+        };
+
+        // Apply GPA bonus (increase rate based on academic performance)
+        let gpa_bonus_percentage = Self::calculate_gpa_bonus(env.clone(), student.clone());
+        if gpa_bonus_percentage > 0 {
+            let bonus = (rate * gpa_bonus_percentage as i128) / 100;
+            rate += bonus; // Increase rate for high-performing students
         }
+
+        rate
     }
 
     pub fn buy_access(env: Env, student: Address, course_id: u64, amount: i128, token: Address) {
         student.require_auth();
 
-        // Check minimum deposit requirement
-        let min_deposit: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinDeposit)
-            .unwrap_or(0);
+        let min_deposit: i128 = env.storage().instance().get(&DataKey::MinDeposit).unwrap_or(0);
         if amount < min_deposit {
-            env.panic_with_error((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidAction,
-            ));
+            panic!("Deposit below minimum");
         }
 
-        // Check if student has active subscription
         if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
-            return; // Free access with subscription
+            return;
         }
 
         let rate = Self::calculate_dynamic_rate(env.clone(), student.clone(), course_id);
-        let seconds_bought = (amount / rate) as u64;
+        if rate <= 0 { panic!("Invalid rate"); }
+
+        let seconds_bought = u64::try_from(amount / rate).expect("Overflow");
         let actual_cost = (seconds_bought as i128) * rate;
         let current_time = env.ledger().timestamp();
 
+        // Perform token transfer
         let client = token::Client::new(&env, &token);
         client.transfer(&student, &env.current_contract_address(), &actual_cost);
+
+        // Apply tuition-stipend split for course payments
+        let (university_share, student_share) = Self::distribute_tuition_stipend_split(
+            &env, 
+            &student, 
+            actual_cost, 
+            &token
+        );
 
         let mut access = env
             .storage()
@@ -208,191 +363,91 @@ impl ScholarContract {
             access.expiry_time = current_time + seconds_bought;
         }
 
+        // Use hardened expiry math
+        access.expiry_time = checked_access_expiry(current_time, access.expiry_time, seconds_bought)
+            .expect("Expiry calculation failed");
+        
         access.last_purchase_time = current_time;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Access(student.clone(), course_id), &access);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Access(student.clone(), course_id),
-            LEDGER_BUMP_THRESHOLD,
-            LEDGER_BUMP_EXTEND,
-        );
 
+        // Distribute royalty for course creators (separate from tuition split)
         Self::distribute_royalty(&env, course_id, actual_cost, &token);
+        
+        // Emit event with split information
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Access_Purchased"), student.clone(), course_id),
+            (actual_cost, university_share, student_share, seconds_bought)
+        );
     }
 
-    pub fn set_course_duration(env: Env, course_id: u64, duration: u64) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::CourseDuration(course_id), &duration);
+        // Distribute royalties
+        Self::distribute_royalty(&env, course_id, actual_cost, &token);
     }
 
     pub fn heartbeat(env: Env, student: Address, course_id: u64, _signature: soroban_sdk::Bytes) {
         student.require_auth();
-
         let current_time = env.ledger().timestamp();
-        let heartbeat_interval: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::HeartbeatInterval)
-            .unwrap_or(60);
+        let access_key = DataKey::Access(student.clone(), course_id);
+        
+        let mut access: Access = env.storage().persistent().get(&access_key).expect("No access record");
+        let interval: u64 = env.storage().instance().get(&DataKey::HeartbeatInterval).unwrap_or(60);
 
-        let mut access = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Access(student.clone(), course_id))
-            .unwrap_or(Access {
-                student: student.clone(),
-                course_id,
-                expiry_time: 0,
-                token: student.clone(),
-                total_watch_time: 0,
-                last_heartbeat: 0,
-                last_purchase_time: 0,
-            });
-
-        // Session validation logic
-        let sig_len = _signature.len();
-        if sig_len != 32 && _signature != soroban_sdk::Bytes::from_slice(&env, b"test_signature") {
-            env.panic_with_error((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidAction,
-            ));
+        if access.last_heartbeat > 0 && (current_time - access.last_heartbeat) < interval {
+            panic!("Heartbeat too frequent");
         }
 
-        let active_session = access.last_heartbeat > 0
-            && (current_time - access.last_heartbeat) <= heartbeat_interval;
-        let stored_session: Option<soroban_sdk::Bytes> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Session(student.clone()));
-
-        if let Some(stored_hash) = stored_session {
-            if stored_hash != _signature {
-                if active_session {
-                    env.panic_with_error((
-                        soroban_sdk::xdr::ScErrorType::Contract,
-                        soroban_sdk::xdr::ScErrorCode::InvalidAction,
-                    ));
-                } else {
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::Session(student.clone()), &_signature);
-                }
-            }
-        } else {
-            env.storage()
-                .instance()
-                .set(&DataKey::Session(student.clone()), &_signature);
+        if current_time >= access.expiry_time {
+            panic!("Access expired");
         }
 
-        // Verify heartbeat timing
-        if access.last_heartbeat > 0 && (current_time - access.last_heartbeat) < heartbeat_interval
-        {
-            env.panic_with_error((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidAction,
-            ));
-        }
-
-        // Update watch time and heartbeat
         if access.last_heartbeat > 0 {
             let elapsed = current_time - access.last_heartbeat;
-            // Only count if it's within a reasonable window of the heartbeat interval
-            // This ensures the contract stops charging if heartbeats are missed
-            if elapsed <= heartbeat_interval + 15 {
-                // 15s grace period for jitter
+            if elapsed <= interval + 15 {
                 access.total_watch_time += elapsed;
             }
         }
         access.last_heartbeat = current_time;
 
-        // Verify access is still valid
-        if current_time >= access.expiry_time {
-            env.panic_with_error((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidAction,
-            ));
-        }
-
-        // SBT Minting Trigger logic
-        let course_duration: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CourseDuration(course_id))
-            .unwrap_or(0);
-        if course_duration > 0 && access.total_watch_time >= course_duration {
-            let is_minted: bool = env
-                .storage()
-                .persistent()
-                .get(&DataKey::SbtMinted(student.clone(), course_id))
-                .unwrap_or(false);
-            if !is_minted {
-                // Trigger SBT Minting Event
-                #[allow(deprecated)]
-                env.events().publish(
-                    (Symbol::new(&env, "SBT_Mint"), student.clone(), course_id),
-                    course_id,
-                );
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::SbtMinted(student.clone(), course_id), &true);
-                env.storage().persistent().extend_ttl(
-                    &DataKey::SbtMinted(student.clone(), course_id),
-                    LEDGER_BUMP_THRESHOLD,
-                    LEDGER_BUMP_EXTEND,
-                );
+        // Check for SBT Mint eligibility
+        let duration: u64 = env.storage().persistent().get(&DataKey::CourseDuration(course_id)).unwrap_or(0);
+        if duration > 0 && access.total_watch_time >= duration {
+            let sbt_key = DataKey::SbtMinted(student.clone(), course_id);
+            if !env.storage().persistent().get(&sbt_key).unwrap_or(false) {
+                env.events().publish((Symbol::new(&env, "SBT_Mint"), student.clone(), course_id), course_id);
+                env.storage().persistent().set(&sbt_key, &true);
+                env.storage().persistent().extend_ttl(&sbt_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
             }
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Access(student.clone(), course_id), &access);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Access(student, course_id),
-            LEDGER_BUMP_THRESHOLD,
-            LEDGER_BUMP_EXTEND,
-        );
+        env.storage().persistent().set(&access_key, &access);
+        env.storage().persistent().extend_ttl(&access_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
     }
 
-    pub fn get_heartbeat_interval(env: Env) -> u64 {
-        env.storage().instance().get(&DataKey::HeartbeatInterval).unwrap_or(60)
-    }
+    fn calculate_dynamic_rate(env: Env, student: Address, course_id: u64) -> i128 {
+        let base_rate: i128 = env.storage().instance().get(&DataKey::BaseRate).unwrap_or(1);
+        let threshold: u64 = env.storage().instance().get(&DataKey::DiscountThreshold).unwrap_or(3600);
+        let percentage: u64 = env.storage().instance().get(&DataKey::DiscountPercentage).unwrap_or(10);
 
-    pub fn get_course_duration(env: Env, course_id: u64) -> u64 {
-        env.storage().persistent().get(&DataKey::CourseDuration(course_id)).unwrap_or(0)
-    }
+        let access: Access = env.storage().persistent().get(&DataKey::Access(student, course_id)).unwrap_or_else(|| {
+            // Return dummy Access if not found
+            Access { student: Address::generate(&env), course_id, expiry_time: 0, token: Address::generate(&env), total_watch_time: 0, last_heartbeat: 0, last_purchase_time: 0 }
+        });
 
-    pub fn get_watch_time(env: Env, student: Address, course_id: u64) -> u64 {
-        let access: Access = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Access(student.clone(), course_id))
-            .unwrap_or(Access {
-                student: student.clone(), // dummy
-                course_id,
-                expiry_time: 0,
-                token: student, // dummy
-                total_watch_time: 0,
-                last_heartbeat: 0,
-                last_purchase_time: 0,
-            });
-        access.total_watch_time
-    }
-
-    pub fn is_sbt_minted(env: Env, student: Address, course_id: u64) -> bool {
-        let key = DataKey::SbtMinted(student, course_id);
-        if env.storage().persistent().has(&key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
-            env.storage().persistent().get(&key).unwrap_or(false)
+        if access.total_watch_time >= threshold {
+            base_rate - (base_rate * percentage as i128 / 100)
         } else {
             false
         }
     }
 
     pub fn has_access(env: Env, student: Address, course_id: u64) -> bool {
+        // Check if student scholarship is disputed
+        if let Some(scholarship) = env.storage().persistent().get(&DataKey::Scholarship(student.clone())) {
+            if scholarship.is_disputed {
+                return false;
+            }
+        }
+
         // Check if course is globally vetoed
         let is_globally_vetoed: bool = env
             .storage()
@@ -417,35 +472,12 @@ impl ScholarContract {
         if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
             return true;
         }
-
-        let access: Access = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Access(student.clone(), course_id))
-            .unwrap_or(Access {
-                student: student.clone(),
-                course_id,
-                expiry_time: 0,
-                token: student.clone(),
-                total_watch_time: 0,
-                last_heartbeat: 0,
-                last_purchase_time: 0,
-            });
-
-        env.ledger().timestamp() < access.expiry_time
     }
 
     fn has_active_subscription(env: Env, student: Address, course_id: u64) -> bool {
-        let subscription: Option<SubscriptionTier> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Subscription(student.clone()));
-
-        if let Some(sub) = subscription {
-            let current_time = env.ledger().timestamp();
-            if current_time < sub.expiry_time && sub.course_ids.contains(&course_id) {
-                return true;
-            }
+        let sub_key = DataKey::Subscription(student);
+        if let Some(sub) = env.storage().persistent().get::<_, SubscriptionTier>(&sub_key) {
+            return env.ledger().timestamp() < sub.expiry_time && sub.course_ids.contains(&course_id);
         }
         false
     }
@@ -531,6 +563,14 @@ impl ScholarContract {
         let client = token::Client::new(&env, &token);
         client.transfer(&funder, &env.current_contract_address(), &amount);
 
+        // Apply tuition-stipend split if configured
+        let (university_amount, student_amount) = Self::distribute_tuition_stipend_split(
+            &env, 
+            &student, 
+            amount, 
+            &token
+        );
+
         let mut scholarship: Scholarship = env
             .storage()
             .persistent()
@@ -541,14 +581,20 @@ impl ScholarContract {
                 unlocked_balance: 0,
                 last_verif: 0,
                 is_paused: false,
+                is_disputed: false,
+                dispute_reason: None,
+                final_ruling: None,
             });
 
-        scholarship.balance += amount;
+        // Only add the student's portion to scholarship balance
+        scholarship.balance += student_amount;
+        scholarship.unlocked_balance += student_amount; // Assume funded amount is unlocked
+        
         env.storage()
             .persistent()
             .set(&DataKey::Scholarship(student.clone()), &scholarship);
 
-        // Emit Scholarship_Granted event
+        // Emit Scholarship_Granted event with split information
         #[allow(deprecated)]
         env.events().publish(
             (
@@ -556,7 +602,7 @@ impl ScholarContract {
                 funder,
                 student.clone(),
             ),
-            amount,
+            (amount, university_amount, student_amount)
         );
     }
 
@@ -790,6 +836,113 @@ impl ScholarContract {
         env.storage().instance().get(&DataKey::AcademicOracle)
     }
 
+    pub fn report_student_gpa(env: Env, oracle: Address, student: Address, gpa: u64) {
+        oracle.require_auth();
+        
+        // Verify caller is the designated academic oracle
+        let stored_oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AcademicOracle)
+            .expect("Academic Oracle not set");
+        if stored_oracle != oracle {
+            panic!("Unauthorized: Not the academic oracle");
+        }
+
+        // Validate GPA range (0.0 to 4.4 stored as 0 to 44)
+        if gpa > 44 {
+            panic!("Invalid GPA: Maximum supported is 4.4");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let gpa_data = StudentGPA {
+            student: student.clone(),
+            gpa,
+            last_updated: current_time,
+            oracle_verified: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::StudentGPA(student.clone()), &gpa_data);
+        env.storage().persistent().extend_ttl(
+            &DataKey::StudentGPA(student),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+
+        // Calculate and emit GPA bonus information
+        let bonus_percentage = Self::calculate_gpa_bonus(env.clone(), student.clone());
+        
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "GPA_Updated"), student, gpa),
+            bonus_percentage,
+        );
+
+        // Trigger on-the-fly drip recalculation for meritocratic adjustment
+        Self::recalculate_drip_rate_on_gpa_change(env.clone(), student.clone());
+    }
+
+    pub fn get_student_gpa(env: Env, student: Address) -> Option<StudentGPA> {
+        let key = DataKey::StudentGPA(student.clone());
+        let gpa_data = env.storage().persistent().get(&key);
+        if gpa_data.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        gpa_data
+    }
+
+    pub fn get_student_gpa_bonus(env: Env, student: Address) -> u64 {
+        Self::calculate_gpa_bonus(env, student)
+    }
+
+    pub fn recalculate_drip_rate_on_gpa_change(env: Env, student: Address) {
+        // This function handles on-the-fly drip recalculation when GPA changes
+        // It preserves the stream start date and remaining balance while adjusting the rate
+        
+        let scholarship: Option<Scholarship> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()));
+        
+        if let Some(mut sch) = scholarship {
+            if !sch.is_paused {
+                // Calculate new rate with updated GPA bonus
+                let base_rate: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::BaseRate)
+                    .unwrap_or(1);
+                
+                // Apply GPA bonus to base rate
+                let gpa_bonus_percentage = Self::calculate_gpa_bonus(env.clone(), student.clone());
+                let new_rate = if gpa_bonus_percentage > 0 {
+                    let bonus = (base_rate * gpa_bonus_percentage as i128) / 100;
+                    base_rate + bonus
+                } else {
+                    base_rate
+                };
+                
+                // Calculate remaining airtime with new rate
+                let remaining_seconds = if new_rate > 0 {
+                    (sch.unlocked_balance / new_rate) as u64
+                } else {
+                    0
+                };
+                
+                // Emit event showing the recalculated rate and remaining time
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "Drip_Rate_Recalculated"), student),
+                    (new_rate, remaining_seconds, gpa_bonus_percentage),
+                );
+            }
+        }
+    }
+
     pub fn pause_scholarship(env: Env, admin: Address, student: Address, status: bool) {
         admin.require_auth();
         if !Self::is_admin(&env, &admin) {
@@ -918,20 +1071,122 @@ impl ScholarContract {
     }
 
     fn distribute_royalty(env: &Env, course_id: u64, total_amount: i128, token: &Address) {
-        let split: Option<RoyaltySplit> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RoyaltySplit(course_id));
-
-        let client = token::Client::new(env, token);
-
-        if let Some(s) = split {
-            for (recipient, percentage) in s.shares.iter() {
+        if let Some(split) = env.storage().persistent().get::<_, RoyaltySplit>(&DataKey::RoyaltySplit(course_id)) {
+            let client = token::Client::new(env, token);
+            for (recipient, percentage) in split.shares.iter() {
                 let share = (total_amount * percentage as i128) / 100;
                 if share > 0 {
-                    client.transfer(&env.current_contract_address(), recipient, &share);
+                    client.transfer(&env.current_contract_address(), &recipient, &share);
                 }
             }
+        }
+    }
+
+    // Tuition-Stipend Split Functions
+    
+    pub fn set_tuition_stipend_split(
+        env: Env,
+        admin: Address,
+        student: Address,
+        university_address: Address,
+        university_percentage: u32,
+        student_percentage: u32,
+    ) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // Validate percentages sum to 100
+        if university_percentage + student_percentage != 100 {
+            panic!("Percentages must sum to 100");
+        }
+        
+        let split_config = TuitionStipendSplit {
+            university_address,
+            student_address: student.clone(),
+            university_percentage,
+            student_percentage,
+        };
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::TuitionStipendSplit(student), &split_config);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TuitionStipendSplit(student),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "TuitionStipendSplit_Configured"), admin, student),
+            (university_address, university_percentage, student_percentage)
+        );
+    }
+    
+    pub fn get_tuition_stipend_split(env: Env, student: Address) -> Option<TuitionStipendSplit> {
+        let key = DataKey::TuitionStipendSplit(student);
+        let split = env.storage().persistent().get(&key);
+        if split.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        split
+    }
+    
+    pub fn distribute_tuition_stipend_split(
+        env: &Env,
+        student: &Address,
+        total_amount: i128,
+        token: &Address,
+    ) -> (i128, i128) {
+        let split: Option<TuitionStipendSplit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TuitionStipendSplit(student));
+        
+        let client = token::Client::new(env, token);
+        
+        if let Some(config) = split {
+            // Calculate university share (70% by default)
+            let university_share = (total_amount * config.university_percentage as i128) / 100;
+            let student_share = (total_amount * config.student_percentage as i128) / 100;
+            
+            // Transfer to university first (priority payment)
+            if university_share > 0 {
+                client.transfer(&env.current_contract_address(), &config.university_address, &university_share);
+            }
+            
+            // Transfer remainder to student
+            if student_share > 0 {
+                client.transfer(&env.current_contract_address(), &config.student_address, &student_share);
+            }
+            
+            // Emit split distribution event
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "TuitionStipendSplit_Distributed"), student, config.university_address),
+                (university_share, student_share)
+            );
+            
+            (university_share, student_share)
+        } else {
+            // No split configured, transfer full amount to student
+            client.transfer(&env.current_contract_address(), student, &total_amount);
+            (0, total_amount)
         }
     }
 
@@ -1298,6 +1553,248 @@ impl ScholarContract {
             env.storage().persistent().get(&key).unwrap_or(0)
         } else {
             0
+        }
+    }
+
+    // Research Grant Milestone Escrow Functions
+    
+    pub fn create_research_grant(
+        env: Env,
+        grantor: Address,
+        student: Address,
+        total_amount: i128,
+        token: Address,
+    ) -> u64 {
+        grantor.require_auth();
+        
+        // Transfer funds to contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&grantor, &env.current_contract_address(), &total_amount);
+        
+        // Generate unique grant ID
+        let grant_id: u64 = env.storage().instance()
+            .get(&Symbol::new(&env, "NextGrantId"))
+            .unwrap_or(1);
+        
+        let current_time = env.ledger().timestamp();
+        
+        let research_grant = ResearchGrant {
+            student: student.clone(),
+            total_amount,
+            token: token.clone(),
+            granted_at: current_time,
+            is_active: true,
+            grantor: grantor.clone(),
+        };
+        
+        // Store the grant
+        env.storage().persistent().set(&DataKey::ResearchGrant(student), &research_grant);
+        env.storage().persistent().extend_ttl(&DataKey::ResearchGrant(student), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Increment next grant ID
+        env.storage().instance().set(&Symbol::new(&env, "NextGrantId"), &(grant_id + 1));
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Research_Grant_Created"), grantor, student),
+            (grant_id, total_amount)
+        );
+        
+        grant_id
+    }
+    
+    pub fn submit_milestone_claim(
+        env: Env,
+        student: Address,
+        milestone_id: u64,
+        amount: i128,
+        description: Symbol,
+        invoice_hash: Symbol,
+    ) {
+        student.require_auth();
+        
+        // Verify student has an active research grant
+        let research_grant: ResearchGrant = env.storage().persistent()
+            .get(&DataKey::ResearchGrant(student.clone()))
+            .expect("No active research grant found");
+        
+        if !research_grant.is_active {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        let current_time = env.ledger().timestamp();
+        
+        let milestone_claim = MilestoneClaim {
+            milestone_id,
+            student: student.clone(),
+            amount,
+            description: description.clone(),
+            invoice_hash: Some(invoice_hash.clone()),
+            is_approved: false,
+            is_claimed: false,
+            submitted_at: current_time,
+            approved_at: None,
+            claimed_at: None,
+        };
+        
+        // Store the milestone claim
+        env.storage().persistent().set(&DataKey::MilestoneClaim(milestone_id), &milestone_claim);
+        env.storage().persistent().set(&DataKey::InvoiceHash(milestone_id), &invoice_hash);
+        env.storage().persistent().extend_ttl(&DataKey::MilestoneClaim(milestone_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        env.storage().persistent().extend_ttl(&DataKey::InvoiceHash(milestone_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Milestone_Claim_Submitted"), student, milestone_id),
+            (amount, description, invoice_hash)
+        );
+    }
+    
+    pub fn approve_milestone_claim(
+        env: Env,
+        grantor: Address,
+        milestone_id: u64,
+    ) {
+        grantor.require_auth();
+        
+        let mut milestone_claim: MilestoneClaim = env.storage().persistent()
+            .get(&DataKey::MilestoneClaim(milestone_id))
+            .expect("Milestone claim not found");
+        
+        // Verify grantor is the one who created the research grant
+        let research_grant: ResearchGrant = env.storage().persistent()
+            .get(&DataKey::ResearchGrant(milestone_claim.student.clone()))
+            .expect("Research grant not found");
+        
+        if research_grant.grantor != grantor {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        if milestone_claim.is_approved {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        let current_time = env.ledger().timestamp();
+        
+        milestone_claim.is_approved = true;
+        milestone_claim.approved_at = Some(current_time);
+        
+        // Store approval status
+        env.storage().persistent().set(&DataKey::MilestoneClaim(milestone_id), &milestone_claim);
+        env.storage().persistent().set(&DataKey::GrantorApproval(milestone_id), &true);
+        env.storage().persistent().extend_ttl(&DataKey::MilestoneClaim(milestone_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        env.storage().persistent().extend_ttl(&DataKey::GrantorApproval(milestone_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Milestone_Claim_Approved"), grantor, milestone_claim.student.clone()),
+            (milestone_id, milestone_claim.amount)
+        );
+    }
+    
+    pub fn claim_milestone_lump_sum(
+        env: Env,
+        student: Address,
+        milestone_id: u64,
+    ) {
+        student.require_auth();
+        
+        let mut milestone_claim: MilestoneClaim = env.storage().persistent()
+            .get(&DataKey::MilestoneClaim(milestone_id))
+            .expect("Milestone claim not found");
+        
+        // Verify the claim belongs to this student
+        if milestone_claim.student != student {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // Verify claim is approved but not yet claimed
+        if !milestone_claim.is_approved || milestone_claim.is_claimed {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // Get the research grant to get token info
+        let research_grant: ResearchGrant = env.storage().persistent()
+            .get(&DataKey::ResearchGrant(student.clone()))
+            .expect("Research grant not found");
+        
+        let current_time = env.ledger().timestamp();
+        
+        // Mark as claimed
+        milestone_claim.is_claimed = true;
+        milestone_claim.claimed_at = Some(current_time);
+        
+        // Update storage
+        env.storage().persistent().set(&DataKey::MilestoneClaim(milestone_id), &milestone_claim);
+        env.storage().persistent().extend_ttl(&DataKey::MilestoneClaim(milestone_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Transfer lump sum from treasury to student
+        let client = token::Client::new(&env, &research_grant.token);
+        client.transfer(&env.current_contract_address(), &student, &milestone_claim.amount);
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Milestone_Lump_Sum_Claimed"), student, milestone_id),
+            (milestone_claim.amount, current_time)
+        );
+    }
+    
+    pub fn get_milestone_claim(env: Env, milestone_id: u64) -> MilestoneClaim {
+        let key = DataKey::MilestoneClaim(milestone_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).expect("Milestone claim not found")
+        } else {
+            panic!("Milestone claim not found");
+        }
+    }
+    
+    pub fn get_research_grant(env: Env, student: Address) -> ResearchGrant {
+        let key = DataKey::ResearchGrant(student);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).expect("Research grant not found")
+        } else {
+            panic!("Research grant not found");
+        }
+    }
+    
+    pub fn get_invoice_hash(env: Env, milestone_id: u64) -> Option<Symbol> {
+        let key = DataKey::InvoiceHash(milestone_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key)
+        } else {
+            None
+        }
+    }
+    
+    pub fn is_milestone_approved(env: Env, milestone_id: u64) -> bool {
+        let key = DataKey::GrantorApproval(milestone_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).unwrap_or(false)
+        } else {
+            false
         }
     }
 
@@ -1803,6 +2300,243 @@ impl ScholarContract {
             module_ids.len()
         );
     }
+
+    // Multi-Sig Academic Board Review Functions
+
+    pub fn init_deans_council(env: Env, admin: Address, members: Vec<Address>, required_signatures: u32) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Validate members count (should be 3 for 2-of-3)
+        if members.len() != 3 {
+            panic!("Deans Council must have exactly 3 members");
+        }
+
+        // Validate required signatures (should be 2 for 2-of-3)
+        if required_signatures != 2 {
+            panic!("Required signatures must be 2 for 2-of-3 multisig");
+        }
+
+        let council = DeansCouncil {
+            members: members.clone(),
+            required_signatures,
+            is_active: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DeansCouncil, &council);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Deans_Council_Initialized"), admin),
+            (members, required_signatures)
+        );
+    }
+
+    pub fn get_deans_council(env: Env) -> Option<DeansCouncil> {
+        env.storage().instance().get(&DataKey::DeansCouncil)
+    }
+
+    fn is_council_member(env: &Env, member: &Address) -> bool {
+        if let Some(council) = env.storage().instance().get(&DataKey::DeansCouncil) {
+            council.members.contains(member) && council.is_active
+        } else {
+            false
+        }
+    }
+
+    pub fn board_pause_request(env: Env, council_member: Address, student: Address, reason: Symbol) {
+        council_member.require_auth();
+
+        // Verify caller is authorized council member
+        if !Self::is_council_member(&env, &council_member) {
+            panic!("Unauthorized: Not a council member");
+        }
+
+        // Check if there's already a pending request for this student
+        if let Some(existing_request) = env.storage().persistent().get(&DataKey::BoardPauseRequest(student.clone())) {
+            if !existing_request.is_executed {
+                panic!("Pause request already pending for this student");
+            }
+        }
+
+        let current_time = env.ledger().timestamp();
+        
+        let mut request = BoardPauseRequest {
+            student: student.clone(),
+            reason: reason.clone(),
+            requested_at: current_time,
+            signatures: Vec::new(&env),
+            is_executed: false,
+            executed_at: None,
+        };
+
+        // Add the first signature
+        request.signatures.push_back(council_member.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BoardPauseRequest(student.clone()), &request);
+
+        // Record the signature
+        env.storage()
+            .persistent()
+            .set(&DataKey::BoardSignature(student.clone(), council_member), &true);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Board_Pause_Requested"), council_member, student),
+            reason
+        );
+    }
+
+    pub fn board_pause_sign(env: Env, council_member: Address, student: Address) {
+        council_member.require_auth();
+
+        // Verify caller is authorized council member
+        if !Self::is_council_member(&env, &council_member) {
+            panic!("Unauthorized: Not a council member");
+        }
+
+        // Check if this member already signed
+        if let Some(_) = env.storage().persistent().get(&DataKey::BoardSignature(student.clone(), council_member.clone())) {
+            panic!("Council member has already signed this request");
+        }
+
+        // Get the existing request
+        let mut request: BoardPauseRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BoardPauseRequest(student.clone()))
+            .unwrap_or_else(|| panic!("No pause request found for this student"));
+
+        if request.is_executed {
+            panic!("Request has already been executed");
+        }
+
+        // Add the signature
+        request.signatures.push_back(council_member.clone());
+
+        // Record the signature
+        env.storage()
+            .persistent()
+            .set(&DataKey::BoardSignature(student.clone(), council_member), &true);
+
+        // Check if we have enough signatures to execute
+        let council: DeansCouncil = env
+            .storage()
+            .instance()
+            .get(&DataKey::DeansCouncil)
+            .expect("Deans Council not initialized");
+
+        if request.signatures.len() >= council.required_signatures as usize {
+            // Execute the pause
+            Self::execute_board_pause(env.clone(), student.clone(), request.clone());
+            request.is_executed = true;
+            request.executed_at = Some(env.ledger().timestamp());
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BoardPauseRequest(student), &request);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Board_Pause_Signed"), council_member, student),
+            request.signatures.len()
+        );
+    }
+
+    fn execute_board_pause(env: Env, student: Address, request: BoardPauseRequest) {
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        scholarship.is_paused = true;
+        scholarship.is_disputed = true;
+        scholarship.dispute_reason = Some(request.reason);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Board_Pause_Executed"), student),
+            (request.signatures.len(), request.reason)
+        );
+    }
+
+    pub fn upload_final_ruling(env: Env, admin: Address, student: Address, ruling: Symbol) {
+        admin.require_auth();
+
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if !scholarship.is_disputed {
+            panic!("Scholarship is not in disputed state");
+        }
+
+        scholarship.final_ruling = Some(ruling.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Final_Ruling_Uploaded"), admin, student),
+            ruling
+        );
+    }
+
+    pub fn get_board_pause_request(env: Env, student: Address) -> Option<BoardPauseRequest> {
+        let key = DataKey::BoardPauseRequest(student);
+        let request = env.storage().persistent().get(&key);
+        if request.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        request
+    }
+
+    pub fn is_disputed(env: Env, student: Address) -> bool {
+        let scholarship: Option<Scholarship> = env.storage().persistent().get(&DataKey::Scholarship(student));
+        scholarship.map_or(false, |s| s.is_disputed)
+    }
 }
 
 mod test;
+mod tuition_stipend_split_tests;

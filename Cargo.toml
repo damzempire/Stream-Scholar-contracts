@@ -1,7 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/*",
   "contracts/*",
+]
+exclude = [
+  "fuzz",
 ]
 
 [workspace.dependencies]
