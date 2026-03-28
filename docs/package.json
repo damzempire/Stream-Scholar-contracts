@@ -1,0 +1,12 @@
+{
+  "name": "stream-scholar-docs",
+  "version": "1.0.0",
+  "description": "Documentation and schemas for Stream Scholar contracts",
+  "scripts": {
+    "validate": "ajv validate -s course-metadata-standard.json -d course-metadata-standard.json --spec=draft7",
+    "test": "npm run validate"
+  },
+  "devDependencies": {
+    "ajv-cli": "^5.0.0"
+  }
+}

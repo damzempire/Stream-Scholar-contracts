@@ -15,6 +15,13 @@ yarn-error.log*
 dist/
 build/
 
+# Rust's output directory
+target
+
+# Local settings
+.soroban
+.stellar
+
 # IDE and editor files
 .vscode/
 .idea/

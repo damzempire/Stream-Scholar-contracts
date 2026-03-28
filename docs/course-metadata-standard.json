@@ -1,0 +1,298 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/akordavid373/Stream-Scholar-contracts/docs/course-metadata-standard.json",
+  "title": "Course Metadata Standard",
+  "description": "Standard JSON schema for course descriptions, thumbnails, and durations to be stored on IPFS",
+  "type": "object",
+  "required": [
+    "courseId",
+    "title",
+    "description",
+    "instructor",
+    "duration",
+    "thumbnail",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "courseId": {
+      "type": "string",
+      "description": "Unique identifier for the course",
+      "pattern": "^[a-zA-Z0-9_-]+$",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "title": {
+      "type": "string",
+      "description": "Course title",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "description": {
+      "type": "string",
+      "description": "Detailed description of the course content",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "instructor": {
+      "type": "object",
+      "description": "Instructor information",
+      "required": ["name", "address"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Instructor's display name",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "address": {
+          "type": "string",
+          "description": "Instructor's wallet address (Stellar address)",
+          "pattern": "^G[A-Z0-9]{55}$"
+        },
+        "bio": {
+          "type": "string",
+          "description": "Optional instructor biography",
+          "maxLength": 500
+        },
+        "avatar": {
+          "type": "string",
+          "description": "IPFS CID for instructor's avatar image",
+          "pattern": "^Qm[1-9A-HJ-NP-Za-km-z]{44,}$|^b[A-Za-z2-7]{58,}$"
+        }
+      }
+    },
+    "duration": {
+      "type": "object",
+      "description": "Course duration information",
+      "required": ["totalMinutes"],
+      "properties": {
+        "totalMinutes": {
+          "type": "integer",
+          "description": "Total course duration in minutes",
+          "minimum": 1,
+          "maximum": 50000
+        },
+        "estimatedHours": {
+          "type": "number",
+          "description": "Estimated duration in hours (calculated as totalMinutes / 60)",
+          "minimum": 0.0167
+        },
+        "format": {
+          "type": "string",
+          "description": "Duration format for display",
+          "enum": ["hours", "minutes", "mixed"]
+        }
+      }
+    },
+    "thumbnail": {
+      "type": "object",
+      "description": "Course thumbnail information",
+      "required": ["ipfsCid"],
+      "properties": {
+        "ipfsCid": {
+          "type": "string",
+          "description": "IPFS CID for the thumbnail image",
+          "pattern": "^Qm[1-9A-HJ-NP-Za-km-z]{44,}$|^b[A-Za-z2-7]{58,}$"
+        },
+        "mimeType": {
+          "type": "string",
+          "description": "MIME type of the thumbnail image",
+          "enum": ["image/jpeg", "image/png", "image/webp", "image/gif"]
+        },
+        "dimensions": {
+          "type": "object",
+          "description": "Image dimensions",
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            }
+          }
+        },
+        "fileSize": {
+          "type": "integer",
+          "description": "File size in bytes",
+          "minimum": 1,
+          "maximum": 10485760
+        }
+      }
+    },
+    "category": {
+      "type": "object",
+      "description": "Course categorization",
+      "properties": {
+        "primary": {
+          "type": "string",
+          "description": "Primary category",
+          "enum": [
+            "programming",
+            "blockchain",
+            "design",
+            "business",
+            "mathematics",
+            "science",
+            "language",
+            "arts",
+            "other"
+          ]
+        },
+        "secondary": {
+          "type": "string",
+          "description": "Secondary category (optional)",
+          "enum": [
+            "programming",
+            "blockchain",
+            "design",
+            "business",
+            "mathematics",
+            "science",
+            "language",
+            "arts",
+            "other"
+          ]
+        },
+        "tags": {
+          "type": "array",
+          "description": "Array of course tags",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 50
+          },
+          "maxItems": 10
+        }
+      }
+    },
+    "difficulty": {
+      "type": "string",
+      "description": "Course difficulty level",
+      "enum": ["beginner", "intermediate", "advanced", "expert"]
+    },
+    "language": {
+      "type": "string",
+      "description": "Course language (ISO 639-1 code)",
+      "pattern": "^[a-z]{2}$",
+      "default": "en"
+    },
+    "price": {
+      "type": "object",
+      "description": "Course pricing information",
+      "properties": {
+        "amount": {
+          "type": "string",
+          "description": "Price amount in smallest currency unit (e.g., stroops for XLM)",
+          "pattern": "^[0-9]+$"
+        },
+        "currency": {
+          "type": "string",
+          "description": "Currency code",
+          "enum": ["XLM", "USDC", "ETH"],
+          "default": "XLM"
+        },
+        "isFree": {
+          "type": "boolean",
+          "description": "Whether the course is free",
+          "default": false
+        }
+      }
+    },
+    "prerequisites": {
+      "type": "array",
+      "description": "List of prerequisite course IDs",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-zA-Z0-9_-]+$"
+      },
+      "maxItems": 10
+    },
+    "learningObjectives": {
+      "type": "array",
+      "description": "Learning objectives for the course",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "maxItems": 10
+    },
+    "createdAt": {
+      "type": "string",
+      "description": "Timestamp when the course was created (ISO 8601 format)",
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": "string",
+      "description": "Timestamp when the course was last updated (ISO 8601 format)",
+      "format": "date-time"
+    },
+    "version": {
+      "type": "string",
+      "description": "Version of the metadata schema",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "default": "1.0.0"
+    },
+    "status": {
+      "type": "string",
+      "description": "Course publication status",
+      "enum": ["draft", "published", "archived", "deprecated"],
+      "default": "draft"
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "courseId": "intro-to-rust-101",
+      "title": "Introduction to Rust Programming",
+      "description": "Learn the fundamentals of Rust programming language, including ownership, borrowing, and memory safety.",
+      "instructor": {
+        "name": "Alice Johnson",
+        "address": "GD5JJ3STX5U5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5",
+        "bio": "Senior Rust developer with 10+ years of experience",
+        "avatar": "QmXxx... (IPFS CID)"
+      },
+      "duration": {
+        "totalMinutes": 480,
+        "estimatedHours": 8,
+        "format": "hours"
+      },
+      "thumbnail": {
+        "ipfsCid": "QmYyy... (IPFS CID)",
+        "mimeType": "image/jpeg",
+        "dimensions": {
+          "width": 1280,
+          "height": 720
+        },
+        "fileSize": 245760
+      },
+      "category": {
+        "primary": "programming",
+        "secondary": "blockchain",
+        "tags": ["rust", "programming", "blockchain", "memory-safety"]
+      },
+      "difficulty": "beginner",
+      "language": "en",
+      "price": {
+        "amount": "10000000",
+        "currency": "XLM",
+        "isFree": false
+      },
+      "prerequisites": [],
+      "learningObjectives": [
+        "Understand Rust's ownership system",
+        "Master borrowing and references",
+        "Write safe concurrent Rust code"
+      ],
+      "createdAt": "2024-03-25T10:00:00Z",
+      "updatedAt": "2024-03-25T10:00:00Z",
+      "version": "1.0.0",
+      "status": "published"
+    }
+  ]
+}
