@@ -8,6 +8,16 @@ const LEDGER_BUMP_THRESHOLD: u32 = 123456; // Example threshold
 const LEDGER_BUMP_EXTEND: u32 = 789012;    // Example extension
 const MAX_COURSE_REGISTRY_SIZE: u64 = 1000;
 const EARLY_DROP_WINDOW_SECONDS: u64 = 300; // 5 minutes
+const MAX_COURSE_REGISTRY_SIZE: u64 = 1000; // Maximum number of courses to prevent gas limit issues
+
+// GPA Bonus Constants
+const GPA_BONUS_THRESHOLD: u64 = 35; // 3.5 GPA threshold (stored as 35 to avoid floating point)
+const GPA_BONUS_PERCENTAGE_PER_POINT: u64 = 20; // 2% per 0.1 GPA (20% per 1.0 GPA)
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Event {
+    SbtMint(Address, u64),
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -72,6 +82,7 @@ pub enum DataKey {
     ModuleLockConfig(u64, u64), // course_id, module_id -> requires_quiz
     ModuleQuizLock(Address, u64, u64), // student, course_id, module_id -> QuizProof
     TuitionStipendSplit(Address), // student -> TuitionStipendSplit struct
+    StudentGPA(Address), // student -> StudentGPA struct
     // Multi-Sig Academic Board Review Keys
     DeansCouncil,
     BoardPauseRequest(Address), // student -> BoardPauseRequest struct
@@ -115,6 +126,15 @@ pub struct TuitionStipendSplit {
     pub student_address: Address,
     pub university_percentage: u32, // Default 70
     pub student_percentage: u32,    // Default 30
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StudentGPA {
+    pub student: Address,
+    pub gpa: u64, // Stored as integer (e.g., 3.7 = 37)
+    pub last_updated: u64,
+    pub oracle_verified: bool,
 }
 
 // Multi-Sig Academic Board Review structs
@@ -211,13 +231,85 @@ impl ScholarContract {
         min_deposit: i128,
         heartbeat_interval: u64,
     ) {
-        // Configuration uses instance storage
-        let storage = env.storage().instance();
-        storage.set(&DataKey::BaseRate, &base_rate);
-        storage.set(&DataKey::DiscountThreshold, &discount_threshold);
-        storage.set(&DataKey::DiscountPercentage, &discount_percentage);
-        storage.set(&DataKey::MinDeposit, &min_deposit);
-        storage.set(&DataKey::HeartbeatInterval, &heartbeat_interval);
+        env.storage().instance().set(&DataKey::BaseRate, &base_rate);
+        env.storage()
+            .instance()
+            .set(&DataKey::DiscountThreshold, &discount_threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::DiscountPercentage, &discount_percentage);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinDeposit, &min_deposit);
+        env.storage()
+            .instance()
+            .set(&DataKey::HeartbeatInterval, &heartbeat_interval);
+    }
+
+    fn calculate_gpa_bonus(env: Env, student: Address) -> u64 {
+        let gpa_data: Option<StudentGPA> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StudentGPA(student.clone()));
+        
+        if let Some(gpa_info) = gpa_data {
+            if gpa_info.oracle_verified && gpa_info.gpa > GPA_BONUS_THRESHOLD {
+                // Calculate how many 0.1 increments above 3.5
+                let gpa_above_threshold = gpa_info.gpa - GPA_BONUS_THRESHOLD; // e.g., 3.7 - 3.5 = 0.2 = 2
+                let bonus_percentage = (gpa_above_threshold * GPA_BONUS_PERCENTAGE_PER_POINT) / 10; // 2 * 20 / 10 = 4%
+                return bonus_percentage;
+            }
+        }
+        0 // No bonus if GPA <= 3.5 or not verified
+    }
+
+    fn calculate_dynamic_rate(env: Env, student: Address, course_id: u64) -> i128 {
+        let base_rate: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BaseRate)
+            .unwrap_or(1);
+        let discount_threshold: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DiscountThreshold)
+            .unwrap_or(3600); // 1 hour default
+        let discount_percentage: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DiscountPercentage)
+            .unwrap_or(10); // 10% default
+
+        let access: Access = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Access(student.clone(), course_id))
+            .unwrap_or(Access {
+                student: student.clone(),
+                course_id,
+                expiry_time: 0,
+                token: student.clone(),
+                total_watch_time: 0,
+                last_heartbeat: 0,
+                last_purchase_time: 0,
+            });
+
+        // Start with base rate and apply watch time discount
+        let mut rate = if access.total_watch_time >= discount_threshold {
+            let discount = (base_rate * discount_percentage as i128) / 100;
+            base_rate - discount
+        } else {
+            base_rate
+        };
+
+        // Apply GPA bonus (increase rate based on academic performance)
+        let gpa_bonus_percentage = Self::calculate_gpa_bonus(env.clone(), student.clone());
+        if gpa_bonus_percentage > 0 {
+            let bonus = (rate * gpa_bonus_percentage as i128) / 100;
+            rate += bonus; // Increase rate for high-performing students
+        }
+
+        rate
     }
 
     pub fn buy_access(env: Env, student: Address, course_id: u64, amount: i128, token: Address) {
@@ -742,6 +834,113 @@ impl ScholarContract {
 
     pub fn get_academic_oracle(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::AcademicOracle)
+    }
+
+    pub fn report_student_gpa(env: Env, oracle: Address, student: Address, gpa: u64) {
+        oracle.require_auth();
+        
+        // Verify caller is the designated academic oracle
+        let stored_oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AcademicOracle)
+            .expect("Academic Oracle not set");
+        if stored_oracle != oracle {
+            panic!("Unauthorized: Not the academic oracle");
+        }
+
+        // Validate GPA range (0.0 to 4.4 stored as 0 to 44)
+        if gpa > 44 {
+            panic!("Invalid GPA: Maximum supported is 4.4");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let gpa_data = StudentGPA {
+            student: student.clone(),
+            gpa,
+            last_updated: current_time,
+            oracle_verified: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::StudentGPA(student.clone()), &gpa_data);
+        env.storage().persistent().extend_ttl(
+            &DataKey::StudentGPA(student),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+
+        // Calculate and emit GPA bonus information
+        let bonus_percentage = Self::calculate_gpa_bonus(env.clone(), student.clone());
+        
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "GPA_Updated"), student, gpa),
+            bonus_percentage,
+        );
+
+        // Trigger on-the-fly drip recalculation for meritocratic adjustment
+        Self::recalculate_drip_rate_on_gpa_change(env.clone(), student.clone());
+    }
+
+    pub fn get_student_gpa(env: Env, student: Address) -> Option<StudentGPA> {
+        let key = DataKey::StudentGPA(student.clone());
+        let gpa_data = env.storage().persistent().get(&key);
+        if gpa_data.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        gpa_data
+    }
+
+    pub fn get_student_gpa_bonus(env: Env, student: Address) -> u64 {
+        Self::calculate_gpa_bonus(env, student)
+    }
+
+    pub fn recalculate_drip_rate_on_gpa_change(env: Env, student: Address) {
+        // This function handles on-the-fly drip recalculation when GPA changes
+        // It preserves the stream start date and remaining balance while adjusting the rate
+        
+        let scholarship: Option<Scholarship> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()));
+        
+        if let Some(mut sch) = scholarship {
+            if !sch.is_paused {
+                // Calculate new rate with updated GPA bonus
+                let base_rate: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::BaseRate)
+                    .unwrap_or(1);
+                
+                // Apply GPA bonus to base rate
+                let gpa_bonus_percentage = Self::calculate_gpa_bonus(env.clone(), student.clone());
+                let new_rate = if gpa_bonus_percentage > 0 {
+                    let bonus = (base_rate * gpa_bonus_percentage as i128) / 100;
+                    base_rate + bonus
+                } else {
+                    base_rate
+                };
+                
+                // Calculate remaining airtime with new rate
+                let remaining_seconds = if new_rate > 0 {
+                    (sch.unlocked_balance / new_rate) as u64
+                } else {
+                    0
+                };
+                
+                // Emit event showing the recalculated rate and remaining time
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "Drip_Rate_Recalculated"), student),
+                    (new_rate, remaining_seconds, gpa_bonus_percentage),
+                );
+            }
+        }
     }
 
     pub fn pause_scholarship(env: Env, admin: Address, student: Address, status: bool) {

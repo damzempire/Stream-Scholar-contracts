@@ -1757,3 +1757,178 @@ fn test_deans_council_validation() {
     }));
     assert!(result.is_err());
 }
+
+#[test]
+fn test_gpa_bonus_calculation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_academic_oracle(&admin, &oracle);
+
+    // Test 1: No GPA reported - should have no bonus
+    assert_eq!(client.get_student_gpa_bonus(&student), 0);
+
+    // Test 2: GPA exactly 3.5 (35) - should have no bonus
+    client.report_student_gpa(&oracle, &student, &35);
+    assert_eq!(client.get_student_gpa_bonus(&student), 0);
+
+    // Test 3: GPA 3.6 (36) - should have 2% bonus
+    client.report_student_gpa(&oracle, &student, &36);
+    assert_eq!(client.get_student_gpa_bonus(&student), 2);
+
+    // Test 4: GPA 3.7 (37) - should have 4% bonus
+    client.report_student_gpa(&oracle, &student, &37);
+    assert_eq!(client.get_student_gpa_bonus(&student), 4);
+
+    // Test 5: GPA 4.0 (40) - should have 10% bonus
+    client.report_student_gpa(&oracle, &student, &40);
+    assert_eq!(client.get_student_gpa_bonus(&student), 10);
+
+    // Test 6: GPA 4.4 (44) - should have 18% bonus (maximum)
+    client.report_student_gpa(&oracle, &student, &44);
+    assert_eq!(client.get_student_gpa_bonus(&student), 18);
+}
+
+#[test]
+fn test_gpa_weighted_flow_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &5000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60); // base_rate = 10
+    client.set_admin(&admin);
+    client.set_academic_oracle(&admin, &oracle);
+
+    // Test without GPA bonus - should pay base rate
+    client.buy_access(&student, &1, &100, &token_address.address());
+    let balance_without_gpa = token_client.balance(&student);
+    
+    // Reset student balance
+    token_client.mint(&student, &5000);
+
+    // Report GPA 4.0 (40) for 10% bonus
+    client.report_student_gpa(&oracle, &student, &40);
+    
+    // Now should pay 10% more (11 tokens per second)
+    client.buy_access(&student, &2, &110, &token_address.address());
+    let balance_with_gpa = token_client.balance(&student);
+    
+    // Should have spent more due to higher rate
+    assert!(balance_with_gpa < balance_without_gpa);
+}
+
+#[test]
+fn test_gpa_data_storage() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let student = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_academic_oracle(&admin, &oracle);
+
+    // Test GPA data storage and retrieval
+    client.report_student_gpa(&oracle, &student, &38); // 3.8 GPA
+    
+    let gpa_data = client.get_student_gpa(&student).unwrap();
+    assert_eq!(gpa_data.gpa, 38);
+    assert_eq!(gpa_data.student, student);
+    assert!(gpa_data.oracle_verified);
+
+    // Test unauthorized GPA reporting
+    let unauthorized = Address::generate(&env);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.report_student_gpa(&unauthorized, &student, &40);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_drip_recalculation_on_gpa_change() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let student = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_academic_oracle(&admin, &oracle);
+
+    // Fund scholarship
+    client.fund_scholarship(&funder, &student, &5000, &token_address.address());
+
+    // Report initial GPA 3.6 (2% bonus)
+    client.report_student_gpa(&oracle, &student, &36);
+
+    // Upgrade GPA to 4.0 (10% bonus) - should trigger recalculation
+    client.report_student_gpa(&oracle, &student, &40);
+
+    // Verify bonus is updated
+    assert_eq!(client.get_student_gpa_bonus(&student), 10);
+}
+
+#[test]
+fn test_gpa_validation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let student = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_academic_oracle(&admin, &oracle);
+
+    // Test invalid GPA (above 4.4)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.report_student_gpa(&oracle, &student, &45); // 4.5 GPA - invalid
+    }));
+    assert!(result.is_err());
+
+    // Test valid GPA (4.4 maximum)
+    client.report_student_gpa(&oracle, &student, &44); // 4.4 GPA - valid
+    assert_eq!(client.get_student_gpa_bonus(&student), 18);
+}

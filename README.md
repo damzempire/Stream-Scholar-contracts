@@ -89,3 +89,117 @@ To verify the setup is successful:
    ```
 
 If all tests pass, the local test network setup is successful.
+
+## GPA-Weighted Flow Rate Bonus Logic
+
+This feature implements a "Meritocratic Drip" system that incentivizes academic excellence by adjusting token flow rates based on student GPA.
+
+### How It Works
+
+**GPA Bonus Calculation:**
+- **Threshold:** 3.5 GPA (stored as 35 to avoid floating-point arithmetic)
+- **Bonus Rate:** 2% increase for every 0.1 GPA point above 3.5
+- **Maximum GPA:** 4.4 (18% maximum bonus)
+- **Oracle Verification:** Only oracle-verified GPAs are considered
+
+**Example Calculations:**
+- 3.5 GPA = 0% bonus (base rate)
+- 3.6 GPA = 2% bonus
+- 3.7 GPA = 4% bonus
+- 4.0 GPA = 10% bonus
+- 4.4 GPA = 18% bonus
+
+### Key Features
+
+**1. Dynamic Rate Adjustment**
+The `calculate_dynamic_rate` function now includes GPA bonuses alongside existing watch time discounts:
+```rust
+// Apply GPA bonus (increase rate based on academic performance)
+let gpa_bonus_percentage = Self::calculate_gpa_bonus(env.clone(), student.clone());
+if gpa_bonus_percentage > 0 {
+    let bonus = (rate * gpa_bonus_percentage as i128) / 100;
+    rate += bonus; // Increase rate for high-performing students
+}
+```
+
+**2. Oracle-Based GPA Reporting**
+Only the designated academic oracle can report student GPAs:
+```rust
+pub fn report_student_gpa(env: Env, oracle: Address, student: Address, gpa: u64)
+```
+
+**3. On-the-Fly Drip Recalculation**
+When GPA updates occur, the system automatically recalculates flow rates without resetting stream start dates:
+```rust
+pub fn recalculate_drip_rate_on_gpa_change(env: Env, student: Address)
+```
+
+### Implementation Details
+
+**Data Structures:**
+```rust
+pub struct StudentGPA {
+    pub student: Address,
+    pub gpa: u64, // Stored as integer (e.g., 3.7 = 37)
+    pub last_updated: u64,
+    pub oracle_verified: bool,
+}
+```
+
+**Constants:**
+```rust
+const GPA_BONUS_THRESHOLD: u64 = 35; // 3.5 GPA threshold
+const GPA_BONUS_PERCENTAGE_PER_POINT: u64 = 20; // 2% per 0.1 GPA (20% per 1.0 GPA)
+```
+
+### Usage Example
+
+1. **Set up Academic Oracle:**
+```bash
+soroban contract invoke --id <CONTRACT_ID> --source <ADMIN> --network standalone -- set_academic_oracle --admin <ADMIN> --oracle <ORACLE_ADDRESS>
+```
+
+2. **Report Student GPA:**
+```bash
+soroban contract invoke --id <CONTRACT_ID> --source <ORACLE> --network standalone -- report_student_gpa --oracle <ORACLE> --student <STUDENT_ADDRESS> --gpa 38
+```
+
+3. **Check GPA Bonus:**
+```bash
+soroban contract invoke --id <CONTRACT_ID> --network standalone -- get_student_gpa_bonus --student <STUDENT_ADDRESS>
+```
+
+4. **Get Student GPA Data:**
+```bash
+soroban contract invoke --id <CONTRACT_ID> --network standalone -- get_student_gpa --student <STUDENT_ADDRESS>
+```
+
+### Events
+
+The system emits events for GPA updates and drip recalculations:
+- `GPA_Updated`: Emitted when a student's GPA is updated
+- `Drip_Rate_Recalculated`: Emitted when flow rates are recalculated due to GPA changes
+
+### Security Considerations
+
+1. **Oracle Authorization:** Only the designated academic oracle can report GPAs
+2. **GPA Validation:** GPAs are validated to be within 0.0-4.4 range
+3. **Verification Flag:** Only oracle-verified GPAs affect bonus calculations
+4. **Backward Compatibility:** Existing functionality remains unchanged
+
+### Testing
+
+Comprehensive tests are included in `test.rs`:
+- `test_gpa_bonus_calculation`: Verifies bonus percentage calculations
+- `test_gpa_weighted_flow_rate`: Tests integration with access purchases
+- `test_gpa_data_storage`: Validates GPA data storage and retrieval
+- `test_drip_recalculation_on_gpa_change`: Tests automatic recalculation
+- `test_gpa_validation`: Ensures GPA validation works correctly
+
+### Benefits
+
+1. **Academic Incentive:** Students are financially motivated to maintain high GPAs
+2. **Meritocratic System:** Higher-performing students receive better rates
+3. **Dynamic Adjustment:** Rates update automatically as academic performance changes
+4. **Preserved Contracts:** Stream start dates and balances remain intact during recalculation
+5. **Gamification:** Creates a competitive environment for academic excellence
