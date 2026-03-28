@@ -1,5 +1,7 @@
 # Rust's output directory
 target
+fuzz/artifacts
+fuzz/corpus
 
 # Local settings
 .soroban

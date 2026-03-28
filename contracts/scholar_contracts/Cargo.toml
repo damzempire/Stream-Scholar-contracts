@@ -9,6 +9,7 @@ crate-type = ["lib", "cdylib"]
 doctest = false
 
 [dependencies]
+expiry_math = { path = "../../crates/expiry_math" }
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]
