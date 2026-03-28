@@ -1,0 +1,19 @@
+[package]
+name = "scholar-contracts-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+expiry_math = { path = "../crates/expiry_math" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "expiry_time_extremes"
+path = "fuzz_targets/expiry_time_extremes.rs"
+test = false
+doc = false

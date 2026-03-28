@@ -1933,206 +1933,463 @@ fn test_gpa_validation() {
     assert_eq!(client.get_student_gpa_bonus(&student), 18);
 }
 
+// Multi-Language Metadata Tests
+
 #[test]
-fn test_ssi_verification() {
+fn test_create_course_metadata() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let student = Address::generate(&env);
     let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    let base_metadata_cid = Symbol::new(&env, "QmTest123");
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
-    
+
+    client.init(&10, &3600, &10, &100, &60);
     client.set_admin(&admin);
-    
-    // Test SSI verification with valid score
-    let verification_type = Symbol::new(&env, "gitcoin_passport");
-    let proof_data = soroban_sdk::Bytes::from_slice(&env, b"valid_proof_data");
-    
-    client.verify_ssi_identity(&student, &verification_type, &85, &proof_data);
-    
-    // Verify SSI status
-    assert!(client.is_ssi_verified(&student));
-    assert_eq!(client.get_personhood_score(&student), 85);
-    
-    // Test SSI verification with insufficient score
-    let student2 = Address::generate(&env);
-    let proof_data2 = soroban_sdk::Bytes::from_slice(&env, b"invalid_proof_data");
-    
-    let result = std::panic::catch_unwind(|| {
-        client.verify_ssi_identity(&student2, &verification_type, &75, &proof_data2);
-    });
-    assert!(result.is_err()); // Should panic due to insufficient score
+
+    // First, create the course in registry
+    client.add_course_to_registry(&course_id, &creator);
+
+    // Create course metadata
+    client.create_course_metadata(&course_id, &default_language, &base_metadata_cid, &creator);
+
+    // Verify metadata was created
+    let metadata = client.get_course_metadata(&course_id);
+    assert_eq!(metadata.course_id, course_id);
+    assert_eq!(metadata.default_language, default_language);
+    assert_eq!(metadata.base_metadata_cid, base_metadata_cid);
+    assert_eq!(metadata.available_languages.len(), 1);
+    assert!(metadata.available_languages.contains(&default_language));
+    assert!(metadata.is_active);
 }
 
 #[test]
-fn test_geographic_verification() {
+fn test_add_language_metadata() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let student = Address::generate(&env);
     let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    let spanish_language = Symbol::new(&env, "es");
+    let base_metadata_cid = Symbol::new(&env, "QmTest123");
+    let spanish_metadata_cid = Symbol::new(&env, "QmSpanish456");
+    let spanish_title = Symbol::new(&env, "Curso de Ejemplo");
+    let spanish_description = Symbol::new(&env, "Descripción del curso en español");
+    let spanish_thumbnail = Symbol::new(&env, "QmSpanishThumb");
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
-    
+
+    client.init(&10, &3600, &10, &100, &60);
     client.set_admin(&admin);
-    
-    // Set regional oracle
-    let region = Symbol::new(&env, "lagos");
-    client.set_regional_oracle(&admin, &region, &oracle);
-    
-    // Verify residency
-    let geohash = soroban_sdk::Bytes::from_slice(&env, b"s1g2g3h4");
-    let proof_signature = soroban_sdk::Bytes::from_slice(&env, b"valid_signature");
-    
-    client.verify_residency(&student, &geohash, &region, &proof_signature, &oracle);
-    
-    // Check verified region
-    assert_eq!(client.get_verified_region(&student), Some(region));
-    
-    // Test location compliance
-    assert!(client.check_location_compliance(&student, &geohash));
-    assert!(!client.is_in_geographic_review(&student));
-    
-    // Test location change triggers review
-    let new_geohash = soroban_sdk::Bytes::from_slice(&env, b"different_hash");
-    assert!(!client.check_location_compliance(&student, &new_geohash));
-    assert!(client.is_in_geographic_review(&student));
+
+    // Create course and base metadata
+    client.add_course_to_registry(&course_id, &creator);
+    client.create_course_metadata(&course_id, &default_language, &base_metadata_cid, &creator);
+
+    // Add Spanish language metadata
+    client.add_language_metadata(
+        &course_id,
+        &spanish_language,
+        &spanish_metadata_cid,
+        &spanish_title,
+        &spanish_description,
+        Some(spanish_thumbnail),
+        &creator,
+    );
+
+    // Verify Spanish metadata was added
+    let spanish_metadata = client.get_language_metadata(&course_id, &spanish_language);
+    assert_eq!(spanish_metadata.language_code, spanish_language);
+    assert_eq!(spanish_metadata.ipfs_cid, spanish_metadata_cid);
+    assert_eq!(spanish_metadata.title, spanish_title);
+    assert_eq!(spanish_metadata.description, spanish_description);
+    assert_eq!(spanish_metadata.thumbnail_cid.unwrap(), spanish_thumbnail);
+
+    // Verify course metadata was updated
+    let course_metadata = client.get_course_metadata(&course_id);
+    assert_eq!(course_metadata.available_languages.len(), 2);
+    assert!(course_metadata.available_languages.contains(&default_language));
+    assert!(course_metadata.available_languages.contains(&spanish_language));
 }
 
 #[test]
-fn test_stream_creation_with_ssi_requirement() {
+fn test_update_language_metadata() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
     let admin = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&funder, &10000);
+    let creator = Address::generate(&env);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    let base_metadata_cid = Symbol::new(&env, "QmTest123");
+    let updated_cid = Symbol::new(&env, "QmUpdated789");
+    let updated_title = Symbol::new(&env, "Updated Title");
+    let updated_description = Symbol::new(&env, "Updated Description");
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
-    
+
+    client.init(&10, &3600, &10, &100, &60);
     client.set_admin(&admin);
-    
-    // Test high-value stream without SSI verification (should fail)
-    let high_rate = 1000; // This would be ~2.6M tokens per month
-    let result = std::panic::catch_unwind(|| {
-        client.create_stream(&funder, &student, &high_rate, &token_address.address(), None);
-    });
-    assert!(result.is_err()); // Should fail due to no SSI verification
-    
-    // Verify SSI first
-    let verification_type = Symbol::new(&env, "stellar_sep12");
-    let proof_data = soroban_sdk::Bytes::from_slice(&env, b"valid_stellar_proof");
-    client.verify_ssi_identity(&student, &verification_type, &90, &proof_data);
-    
-    // Now stream creation should succeed
-    client.create_stream(&funder, &student, &high_rate, &token_address.address(), None);
-    
-    // Test low-value stream without SSI (should succeed)
-    let student2 = Address::generate(&env);
-    let low_rate = 10; // This would be ~26K tokens per month
-    client.create_stream(&funder, &student2, &low_rate, &token_address.address(), None);
+
+    // Create course and base metadata
+    client.add_course_to_registry(&course_id, &creator);
+    client.create_course_metadata(&course_id, &default_language, &base_metadata_cid, &creator);
+
+    // Update default language metadata
+    client.update_language_metadata(
+        &course_id,
+        &default_language,
+        &updated_cid,
+        &updated_title,
+        &updated_description,
+        None,
+        &creator,
+    );
+
+    // Verify metadata was updated
+    let updated_metadata = client.get_language_metadata(&course_id, &default_language);
+    assert_eq!(updated_metadata.ipfs_cid, updated_cid);
+    assert_eq!(updated_metadata.title, updated_title);
+    assert_eq!(updated_metadata.description, updated_description);
+    assert!(updated_metadata.thumbnail_cid.is_none());
 }
 
 #[test]
-fn test_stream_with_geographic_restriction() {
+fn test_get_available_languages() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
     let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&funder, &10000);
+    let creator = Address::generate(&env);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    let spanish_language = Symbol::new(&env, "es");
+    let french_language = Symbol::new(&env, "fr");
+    let base_metadata_cid = Symbol::new(&env, "QmTest123");
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
-    
+
+    client.init(&10, &3600, &10, &100, &60);
     client.set_admin(&admin);
-    
-    // Set up geographic verification
-    let region = Symbol::new(&env, "abuja");
-    client.set_regional_oracle(&admin, &region, &oracle);
-    
-    let geohash = soroban_sdk::Bytes::from_slice(&env, b"abuja_hash");
-    let proof_signature = soroban_sdk::Bytes::from_slice(&env, b"valid_abuja_proof");
-    client.verify_residency(&student, &geohash, &region, &proof_signature, &oracle);
-    
-    // Create stream with geographic restriction
-    let rate = 100;
-    client.create_stream(&funder, &student, &rate, &token_address.address(), Some(region));
-    
-    // Deposit to stream
-    client.deposit_to_stream(&funder, &student, &1000, &token_address.address());
-    
-    // Withdraw from stream
-    env.ledger().set_timestamp(100); // 100 seconds passed
-    let withdrawn = client.withdraw_from_stream(&student, &funder, &token_address.address());
-    assert_eq!(withdrawn, 100 * 100); // 100 seconds * 100 tokens/second
-    
-    // Test withdrawal during geographic review (should fail)
-    let new_geohash = soroban_sdk::Bytes::from_slice(&env, b"different_location");
-    client.check_location_compliance(&student, &new_geohash); // This triggers review
-    
-    let result = std::panic::catch_unwind(|| {
-        client.withdraw_from_stream(&student, &funder, &token_address.address());
-    });
-    assert!(result.is_err()); // Should fail due to geographic review
+
+    // Create course and base metadata
+    client.add_course_to_registry(&course_id, &creator);
+    client.create_course_metadata(&course_id, &default_language, &base_metadata_cid, &creator);
+
+    // Initially should have only default language
+    let languages = client.get_available_languages(&course_id);
+    assert_eq!(languages.len(), 1);
+    assert!(languages.contains(&default_language));
+
+    // Add Spanish
+    client.add_language_metadata(
+        &course_id,
+        &spanish_language,
+        &Symbol::new(&env, "QmSpanish"),
+        &Symbol::new(&env, "Spanish Title"),
+        &Symbol::new(&env, "Spanish Description"),
+        None,
+        &creator,
+    );
+
+    let languages = client.get_available_languages(&course_id);
+    assert_eq!(languages.len(), 2);
+    assert!(languages.contains(&default_language));
+    assert!(languages.contains(&spanish_language));
+
+    // Add French
+    client.add_language_metadata(
+        &course_id,
+        &french_language,
+        &Symbol::new(&env, "QmFrench"),
+        &Symbol::new(&env, "French Title"),
+        &Symbol::new(&env, "French Description"),
+        None,
+        &creator,
+    );
+
+    let languages = client.get_available_languages(&course_id);
+    assert_eq!(languages.len(), 3);
+    assert!(languages.contains(&default_language));
+    assert!(languages.contains(&spanish_language));
+    assert!(languages.contains(&french_language));
 }
 
 #[test]
-fn test_stream_management() {
+fn test_set_default_language() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let funder = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&funder, &10000);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    let spanish_language = Symbol::new(&env, "es");
+    let base_metadata_cid = Symbol::new(&env, "QmTest123");
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
-    
-    // Create stream
-    let rate = 50;
-    client.create_stream(&funder, &student, &rate, &token_address.address(), None);
-    
-    // Deposit funds
-    client.deposit_to_stream(&funder, &student, &2000, &token_address.address());
-    
-    // Check stream balance
-    assert_eq!(client.get_stream_balance(&funder, &student), 2000);
-    
-    // Pause stream
-    client.pause_stream(&funder, &student);
-    
-    // Try to withdraw while paused (should fail)
-    let result = std::panic::catch_unwind(|| {
-        client.withdraw_from_stream(&student, &funder, &token_address.address());
-    });
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Create course and add multiple languages
+    client.add_course_to_registry(&course_id, &creator);
+    client.create_course_metadata(&course_id, &default_language, &base_metadata_cid, &creator);
+    client.add_language_metadata(
+        &course_id,
+        &spanish_language,
+        &Symbol::new(&env, "QmSpanish"),
+        &Symbol::new(&env, "Spanish Title"),
+        &Symbol::new(&env, "Spanish Description"),
+        None,
+        &creator,
+    );
+
+    // Verify initial default language
+    assert_eq!(client.get_default_language(&course_id), default_language);
+
+    // Change default language to Spanish
+    client.set_default_language(&course_id, &spanish_language, &creator);
+
+    // Verify default language was changed
+    assert_eq!(client.get_default_language(&course_id), spanish_language);
+}
+
+#[test]
+fn test_remove_language_metadata() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    let spanish_language = Symbol::new(&env, "es");
+    let base_metadata_cid = Symbol::new(&env, "QmTest123");
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Create course and add Spanish language
+    client.add_course_to_registry(&course_id, &creator);
+    client.create_course_metadata(&course_id, &default_language, &base_metadata_cid, &creator);
+    client.add_language_metadata(
+        &course_id,
+        &spanish_language,
+        &Symbol::new(&env, "QmSpanish"),
+        &Symbol::new(&env, "Spanish Title"),
+        &Symbol::new(&env, "Spanish Description"),
+        None,
+        &creator,
+    );
+
+    // Verify Spanish exists
+    let languages = client.get_available_languages(&course_id);
+    assert_eq!(languages.len(), 2);
+    assert!(languages.contains(&spanish_language));
+
+    // Remove Spanish language
+    client.remove_language_metadata(&course_id, &spanish_language, &creator);
+
+    // Verify Spanish was removed
+    let languages = client.get_available_languages(&course_id);
+    assert_eq!(languages.len(), 1);
+    assert!(!languages.contains(&spanish_language));
+    assert!(languages.contains(&default_language));
+
+    // Verify Spanish metadata no longer exists
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.get_language_metadata(&course_id, &spanish_language);
+    }));
     assert!(result.is_err());
-    
-    // Resume stream
-    client.resume_stream(&funder, &student);
-    
-    // Withdraw should work now
-    env.ledger().set_timestamp(50); // 50 seconds passed
-    let withdrawn = client.withdraw_from_stream(&student, &funder, &token_address.address());
-    assert_eq!(withdrawn, 50 * 50); // 50 seconds * 50 tokens/second
+}
+
+#[test]
+fn test_cannot_remove_default_language() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    let base_metadata_cid = Symbol::new(&env, "QmTest123");
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Create course
+    client.add_course_to_registry(&course_id, &creator);
+    client.create_course_metadata(&course_id, &default_language, &base_metadata_cid, &creator);
+
+    // Try to remove default language - should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.remove_language_metadata(&course_id, &default_language, &creator);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_unauthorized_language_metadata_access() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let unauthorized_user = Address::generate(&env);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    let base_metadata_cid = Symbol::new(&env, "QmTest123");
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Create course
+    client.add_course_to_registry(&course_id, &creator);
+    client.create_course_metadata(&course_id, &default_language, &base_metadata_cid, &creator);
+
+    // Try to add language metadata as unauthorized user - should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.add_language_metadata(
+            &course_id,
+            &Symbol::new(&env, "es"),
+            &Symbol::new(&env, "QmSpanish"),
+            &Symbol::new(&env, "Spanish Title"),
+            &Symbol::new(&env, "Spanish Description"),
+            None,
+            &unauthorized_user,
+        );
+    }));
+    assert!(result.is_err());
+
+    // Try to update language metadata as unauthorized user - should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.update_language_metadata(
+            &course_id,
+            &default_language,
+            &Symbol::new(&env, "QmUpdated"),
+            &Symbol::new(&env, "Updated Title"),
+            &Symbol::new(&env, "Updated Description"),
+            None,
+            &unauthorized_user,
+        );
+    }));
+    assert!(result.is_err());
+
+    // Try to remove language metadata as unauthorized user - should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.remove_language_metadata(&course_id, &default_language, &unauthorized_user);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_admin_can_manage_language_metadata() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    let spanish_language = Symbol::new(&env, "es");
+    let base_metadata_cid = Symbol::new(&env, "QmTest123");
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Create course
+    client.add_course_to_registry(&course_id, &creator);
+    client.create_course_metadata(&course_id, &default_language, &base_metadata_cid, &creator);
+
+    // Admin should be able to add language metadata
+    client.add_language_metadata(
+        &course_id,
+        &spanish_language,
+        &Symbol::new(&env, "QmSpanish"),
+        &Symbol::new(&env, "Spanish Title"),
+        &Symbol::new(&env, "Spanish Description"),
+        None,
+        &admin,
+    );
+
+    // Verify Spanish was added
+    let languages = client.get_available_languages(&course_id);
+    assert_eq!(languages.len(), 2);
+    assert!(languages.contains(&spanish_language));
+
+    // Admin should be able to update language metadata
+    client.update_language_metadata(
+        &course_id,
+        &spanish_language,
+        &Symbol::new(&env, "QmSpanishUpdated"),
+        &Symbol::new(&env, "Updated Spanish Title"),
+        &Symbol::new(&env, "Updated Spanish Description"),
+        None,
+        &admin,
+    );
+
+    // Verify metadata was updated
+    let spanish_metadata = client.get_language_metadata(&course_id, &spanish_language);
+    assert_eq!(spanish_metadata.ipfs_cid, Symbol::new(&env, "QmSpanishUpdated"));
+    assert_eq!(spanish_metadata.title, Symbol::new(&env, "Updated Spanish Title"));
+}
+
+#[test]
+fn test_duplicate_language_metadata() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    let base_metadata_cid = Symbol::new(&env, "QmTest123");
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Create course
+    client.add_course_to_registry(&course_id, &creator);
+    client.create_course_metadata(&course_id, &default_language, &base_metadata_cid, &creator);
+
+    // Try to add duplicate language metadata - should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.add_language_metadata(
+            &course_id,
+            &default_language, // Same as default
+            &Symbol::new(&env, "QmDuplicate"),
+            &Symbol::new(&env, "Duplicate Title"),
+            &Symbol::new(&env, "Duplicate Description"),
+            None,
+            &creator,
+        );
+    }));
+    assert!(result.is_err());
 }

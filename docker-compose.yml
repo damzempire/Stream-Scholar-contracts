@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  soroban-local:
+    image: stellar/soroban-cli:latest
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    ports:
+      - "8000:8000"  # Soroban RPC port
+    command: ["./scripts/setup-local.sh"]
+    stdin_open: true
+    tty: true
