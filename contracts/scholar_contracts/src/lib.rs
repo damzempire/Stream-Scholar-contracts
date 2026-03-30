@@ -261,6 +261,10 @@ pub enum DataKey {
     TaxRate,
     // Issue #122: On-Chain Graduation Credential Registry
     GraduationRegistry(Address), // student -> GraduateProfile
+    // Issue #116: Sub-Scholarship Delegation for Departments
+    DepartmentVault(Address),              // department_manager -> DepartmentVault
+    DepartmentDelegation(Address, Address), // (department_manager, student) -> DepartmentDelegation
+    DepartmentDelegationCount(Address),    // department_manager -> u64 (number of active delegations)
 }
 
 #[contracttype]
@@ -371,6 +375,33 @@ pub struct ResearchGrant {
     pub total_amount: i128,
     pub token: Address,
     pub is_locked: bool,
+}
+
+// Issue #116: Sub-Scholarship Delegation for Departments
+/// A token pool granted by the Main Donor to a department manager (e.g. CS Dean).
+/// The manager can distribute and revoke allocations among their students
+/// without requiring a central admin or DAO vote for each action.
+#[contracttype]
+#[derive(Clone)]
+pub struct DepartmentVault {
+    pub manager: Address,       // e.g. CS Dean
+    pub token: Address,
+    pub total_allocated: i128,  // Total tokens granted by the Main Donor
+    pub distributed: i128,      // Tokens already delegated to students
+    pub is_active: bool,
+    pub created_at: u64,
+}
+
+/// A per-student allocation carved out of a DepartmentVault.
+#[contracttype]
+#[derive(Clone)]
+pub struct DepartmentDelegation {
+    pub manager: Address,
+    pub student: Address,
+    pub amount: i128,
+    pub claimed: i128,
+    pub is_active: bool,
+    pub created_at: u64,
 }
 
 #[contract]
@@ -835,5 +866,197 @@ impl ScholarContract {
             .get(&DataKey::GraduationRegistry(student))
     }
 
+    // --- Issue #116: Sub-Scholarship_Delegation_for_Departments ---
+
+    /// Main Donor grants "Manager Rights" over a token pool to a department sub-admin.
+    /// The donor transfers `pool_amount` tokens into the contract and designates
+    /// `manager` (e.g. CS Dean) as the sole authority over that pool.
+    pub fn grant_manager_rights(
+        env: Env,
+        donor: Address,
+        manager: Address,
+        pool_amount: i128,
+        token: Address,
+    ) {
+        donor.require_auth();
+        assert!(pool_amount > 0, "Pool amount must be positive");
+
+        // Ensure no vault already exists for this manager (one vault per manager)
+        assert!(
+            !env.storage()
+                .persistent()
+                .has(&DataKey::DepartmentVault(manager.clone())),
+            "Manager already has an active vault"
+        );
+
+        // Pull tokens from donor into the contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&donor, &env.current_contract_address(), &pool_amount);
+
+        let vault = DepartmentVault {
+            manager: manager.clone(),
+            token,
+            total_allocated: pool_amount,
+            distributed: 0,
+            is_active: true,
+            created_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::DepartmentVault(manager.clone()), &vault);
+
+        env.events()
+            .publish((Symbol::new(&env, "vault_created"), manager), pool_amount);
+    }
+
+    /// Manager delegates a specific token amount to a student from their vault.
+    /// The manager can revoke and re-delegate at any time.
+    pub fn delegate_to_student(
+        env: Env,
+        manager: Address,
+        student: Address,
+        amount: i128,
+    ) {
+        manager.require_auth();
+        assert!(amount > 0, "Delegation amount must be positive");
+
+        let mut vault: DepartmentVault = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DepartmentVault(manager.clone()))
+            .expect("No vault found for this manager");
+
+        assert!(vault.is_active, "Vault is not active");
+        assert_eq!(vault.manager, manager, "Caller is not the vault manager");
+
+        let available = vault.total_allocated - vault.distributed;
+        assert!(amount <= available, "Insufficient vault balance");
+
+        // If a delegation already exists for this student, top it up
+        let delegation_key = DataKey::DepartmentDelegation(manager.clone(), student.clone());
+        let mut delegation: DepartmentDelegation = env
+            .storage()
+            .persistent()
+            .get(&delegation_key)
+            .unwrap_or(DepartmentDelegation {
+                manager: manager.clone(),
+                student: student.clone(),
+                amount: 0,
+                claimed: 0,
+                is_active: true,
+                created_at: env.ledger().timestamp(),
+            });
+
+        delegation.amount += amount;
+        delegation.is_active = true;
+        vault.distributed += amount;
+
+        env.storage()
+            .persistent()
+            .set(&delegation_key, &delegation);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DepartmentVault(manager.clone()), &vault);
+
+        env.events()
+            .publish((Symbol::new(&env, "delegated"), manager, student), amount);
+    }
+
+    /// Student claims their delegated tokens from the department vault.
+    pub fn claim_department_delegation(
+        env: Env,
+        manager: Address,
+        student: Address,
+    ) {
+        student.require_auth();
+
+        let delegation_key = DataKey::DepartmentDelegation(manager.clone(), student.clone());
+        let mut delegation: DepartmentDelegation = env
+            .storage()
+            .persistent()
+            .get(&delegation_key)
+            .expect("No delegation found");
+
+        assert!(delegation.is_active, "Delegation has been revoked");
+        assert_eq!(delegation.student, student, "Not the delegation recipient");
+
+        let claimable = delegation.amount - delegation.claimed;
+        assert!(claimable > 0, "Nothing to claim");
+
+        let vault: DepartmentVault = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DepartmentVault(manager.clone()))
+            .expect("Vault not found");
+
+        delegation.claimed += claimable;
+        env.storage()
+            .persistent()
+            .set(&delegation_key, &delegation);
+
+        let client = token::Client::new(&env, &vault.token);
+        client.transfer(&env.current_contract_address(), &student, &claimable);
+
+        env.events()
+            .publish((Symbol::new(&env, "del_claimed"), manager, student), claimable);
+    }
+
+    /// Manager revokes a student's unclaimed delegation, returning tokens to the vault.
+    pub fn revoke_student_delegation(
+        env: Env,
+        manager: Address,
+        student: Address,
+    ) {
+        manager.require_auth();
+
+        let delegation_key = DataKey::DepartmentDelegation(manager.clone(), student.clone());
+        let mut delegation: DepartmentDelegation = env
+            .storage()
+            .persistent()
+            .get(&delegation_key)
+            .expect("No delegation found");
+
+        assert!(delegation.is_active, "Delegation already revoked");
+        assert_eq!(delegation.manager, manager, "Caller is not the vault manager");
+
+        let unclaimed = delegation.amount - delegation.claimed;
+
+        // Return unclaimed tokens to the vault's available balance
+        let mut vault: DepartmentVault = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DepartmentVault(manager.clone()))
+            .expect("Vault not found");
+
+        vault.distributed -= unclaimed;
+        delegation.is_active = false;
+
+        env.storage()
+            .persistent()
+            .set(&delegation_key, &delegation);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DepartmentVault(manager.clone()), &vault);
+
+        env.events()
+            .publish((Symbol::new(&env, "del_revoked"), manager, student), unclaimed);
+    }
+
+    /// Read-only: returns the vault state for a given manager.
+    pub fn get_department_vault(env: Env, manager: Address) -> Option<DepartmentVault> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DepartmentVault(manager))
+    }
+
+    /// Read-only: returns the delegation state for a (manager, student) pair.
+    pub fn get_department_delegation(
+        env: Env,
+        manager: Address,
+        student: Address,
+    ) -> Option<DepartmentDelegation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DepartmentDelegation(manager, student))
     }
 }
