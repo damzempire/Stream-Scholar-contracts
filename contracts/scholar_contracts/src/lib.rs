@@ -46,6 +46,8 @@ pub enum Event {
     ProbationStarted(Address, u64), // student, warning_period_end
     ProbationEnded(Address, bool), // student, recovered
     StreamRevoked(Address), // student
+    // Burn deflationary tokenomics event
+    ScholarshipBurned(Address, Address, i128), // admin, student, burned_amount
 }
 
 
@@ -701,10 +703,6 @@ impl ScholarContract {
             (Symbol::new(&env, "Access_Purchased"), student.clone(), course_id),
             (actual_cost, university_share, student_share, seconds_bought)
         );
-    }
-
-        // Distribute royalties
-        Self::distribute_royalty(&env, course_id, actual_cost, &token);
     }
 
     pub fn heartbeat(env: Env, student: Address, course_id: u64, _signature: soroban_sdk::Bytes) {
@@ -2943,6 +2941,74 @@ impl ScholarContract {
         None
     }
 
+    /// Burns the remaining scholarship tokens for a student who has maliciously dropped out.
+    ///
+    /// Instead of returning unspent funds to the donor, this function destroys them by
+    /// calling the token's burn mechanism, permanently reducing the total token supply.
+    /// This creates deflationary tokenomics that reward successful graduates by increasing
+    /// the relative value of their earned credentials and associated loyalty tokens.
+    ///
+    /// - Requires admin authorization (admin acts as arbiter of the donor's burn request).
+    /// - Panics if the scholarship does not exist or already has a zero balance.
+    /// - Returns the amount of tokens burned.
+    pub fn revoke_and_burn(env: Env, admin: Address, student: Address) -> i128 {
+        admin.require_auth();
+
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+
+        let scholarship_key = DataKey::Scholarship(student.clone());
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&scholarship_key)
+            .expect("Scholarship not found");
+
+        if scholarship.balance <= 0 {
+            panic!("No remaining balance to burn");
+        }
+
+        let burn_amount = scholarship.balance;
+        let token = scholarship.token.clone();
+
+        // Burn the remaining tokens from the contract's holdings.
+        // This reduces the token's total supply, making the tokenomics deflationary.
+        let client = token::Client::new(&env, &token);
+        client.burn(&env.current_contract_address(), &burn_amount);
+
+        // Zero out the scholarship and mark it as permanently burned.
+        scholarship.balance = 0;
+        scholarship.unlocked_balance = 0;
+        scholarship.is_disputed = true;
+        scholarship.dispute_reason = Some(Symbol::new(&env, "MALICIOUS_DROPOUT"));
+        scholarship.final_ruling = Some(Symbol::new(&env, "BURNED"));
+
+        env.storage().persistent().set(&scholarship_key, &scholarship);
+        env.storage().persistent().extend_ttl(
+            &scholarship_key,
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+
+        // Clear any active probation record for this student.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ProbationStatus(student.clone()));
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "ScholarshipBurned"),
+                admin.clone(),
+                student,
+            ),
+            (burn_amount, token),
+        );
+
+        burn_amount
+    }
+
     /// Deactivate an agreement (e.g., after scholarship completion or dispute)
     pub fn deactivate_agreement(env: Env, admin: Address, agreement_id: u64) {
         admin.require_auth();
@@ -2965,7 +3031,6 @@ impl ScholarContract {
         );
     }
 
-    }
 }
 
 mod test;

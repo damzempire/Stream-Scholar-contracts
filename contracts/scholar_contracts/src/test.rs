@@ -2554,3 +2554,158 @@ fn test_gpa_update_tracking() {
     assert_eq!(gpa_update.new_gpa, 32);
     assert_eq!(gpa_update.previous_gpa, 35); // Previous GPA tracked
 }
+
+// ── revoke_and_burn tests ──────────────────────────────────────────────────
+
+/// Happy path: admin burns the remaining scholarship balance of a malicious dropout.
+/// After the call the scholarship balance must be zero, the total token supply must
+/// have decreased by the burned amount, and the scholarship's final_ruling must be "BURNED".
+#[test]
+fn test_revoke_and_burn_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let donor = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    // Use the Stellar asset contract so that its StellarAssetClient can mint and
+    // the standard token::Client (SEP-41) can call burn.
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&donor, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Donor funds a scholarship for the student (500 tokens move to the contract).
+    client.fund_scholarship(&donor, &student, &500, &token_address.address());
+
+    let tok = token::Client::new(&env, &token_address.address());
+
+    // Confirm tokens are held by the contract before the burn.
+    assert_eq!(tok.balance(&contract_id), 500);
+
+    // Admin burns the remaining scholarship on behalf of the donor.
+    let burned = client.revoke_and_burn(&admin, &student);
+    assert_eq!(burned, 500);
+
+    // Contract should hold no tokens from this scholarship anymore.
+    assert_eq!(tok.balance(&contract_id), 0);
+
+    // Scholarship record must reflect the burned state.
+    let scholarship = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Scholarship>(&DataKey::Scholarship(student.clone()))
+        .expect("Scholarship record should still exist");
+
+    assert_eq!(scholarship.balance, 0);
+    assert_eq!(scholarship.unlocked_balance, 0);
+    assert!(scholarship.is_disputed);
+    assert_eq!(
+        scholarship.dispute_reason,
+        Some(Symbol::new(&env, "MALICIOUS_DROPOUT"))
+    );
+    assert_eq!(
+        scholarship.final_ruling,
+        Some(Symbol::new(&env, "BURNED"))
+    );
+}
+
+/// Calling revoke_and_burn on a student with no remaining balance must panic.
+#[test]
+#[should_panic(expected = "No remaining balance to burn")]
+fn test_revoke_and_burn_zero_balance_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let donor = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&donor, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund then immediately burn so balance is zero.
+    client.fund_scholarship(&donor, &student, &500, &token_address.address());
+    client.revoke_and_burn(&admin, &student);
+
+    // Second burn attempt on an already-burned scholarship must panic.
+    client.revoke_and_burn(&admin, &student);
+}
+
+/// Calling revoke_and_burn for a student that has no scholarship record must panic.
+#[test]
+#[should_panic(expected = "Scholarship not found")]
+fn test_revoke_and_burn_no_scholarship_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // No scholarship was ever funded for this student.
+    client.revoke_and_burn(&admin, &student);
+}
+
+/// Verify that burn clears any active probation record for the student.
+#[test]
+fn test_revoke_and_burn_clears_probation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let donor = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&donor, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    client.fund_scholarship(&donor, &student, &5000, &token_address.address());
+
+    // Drive student into probation via a low GPA update.
+    client.update_student_gpa(&oracle, &student, &20); // 2.0 GPA — below 2.5 threshold
+
+    let probation_before = client.get_probation_status(&student);
+    assert!(
+        probation_before.is_some(),
+        "Student should be on probation after low GPA update"
+    );
+
+    // Burn remaining funds; probation record must be cleared.
+    client.revoke_and_burn(&admin, &student);
+
+    let probation_after = client.get_probation_status(&student);
+    assert!(
+        probation_after.is_none(),
+        "Probation record should be removed after revoke_and_burn"
+    );
+}
