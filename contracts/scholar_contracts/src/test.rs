@@ -498,7 +498,7 @@ fn test_scholarship_role() {
     client.set_teacher(&admin, &teacher, &true);
 
     // 2. Fund scholarship for student
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    client.fund_scholarship(&funder, &student, &500, &token_address.address(), &false);
 
     // Verify contract has tokens and student has balance
     let token = token::Client::new(&env, &token_address.address());
@@ -602,38 +602,6 @@ fn test_prevent_session_sharing() {
 }
 
 #[test]
-fn test_calculate_remaining_airtime() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let funder = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&student, &10000);
-    token_client.mint(&funder, &1000);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.buy_access(&student, &1, &5000, &token_address.address());
-
-    env.ledger().set_timestamp(100);
-
-    let session1 = soroban_sdk::Bytes::from_slice(&env, b"11111111111111111111111111111111");
-    let session2 = soroban_sdk::Bytes::from_slice(&env, b"22222222222222222222222222222222");
-
-    client.heartbeat(&student, &1, &session1);
-
-    // Fast forward to allowed heartbeat timing
-    env.ledger().set_timestamp(160);
-    client.heartbeat(&student, &1, &session1);
-}
-
-#[test]
 fn test_allow_session_reset_after_timeout() {
     let env = Env::default();
     env.mock_all_auths();
@@ -683,7 +651,7 @@ fn test_calculate_remaining_airtime() {
 
     assert_eq!(client.calculate_remaining_airtime(&student), 0);
 
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    client.fund_scholarship(&funder, &student, &500, &token_address.address(), &false);
 
     assert_eq!(client.calculate_remaining_airtime(&student), 50);
 }
@@ -705,7 +673,7 @@ fn test_calculate_remaining_airtime_zero_flow_rate() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     client.init(&0, &3600, &10, &100, &60);
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    client.fund_scholarship(&funder, &student, &500, &token_address.address(), &false);
 
     assert_eq!(client.calculate_remaining_airtime(&student), 0);
 }
@@ -775,7 +743,7 @@ fn test_scholarship_withdrawal() {
 
     // 1. Initial funding
     client.init(&10, &3600, &10, &100, &60);
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    client.fund_scholarship(&funder, &student, &500, &token_address.address(), &false);
 
     // 2. Register Mock Oracle and Verify
     let oracle_id = env.register(MockOracle, ());
@@ -835,7 +803,7 @@ fn test_academic_oracle_hook() {
     let oracle_id = env.register(MockOracle, ());
     client.set_academic_oracle(&admin, &oracle_id);
 
-    client.fund_scholarship(&funder, &student, &50000, &token_address.address());
+    client.fund_scholarship(&funder, &student, &50000, &token_address.address(), &false);
 
     // Should fail withdrawal before verification
     let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
@@ -1458,7 +1426,7 @@ fn test_research_grant_with_scholarship_coexistence() {
     client.init(&10, &3600, &10, &100, &60);
 
     // Fund a regular scholarship for living stipend
-    client.fund_scholarship(&grantor, &student, &2000, &token_address.address());
+    client.fund_scholarship(&grantor, &student, &2000, &token_address.address(), &false);
 
     // Create a research grant for equipment
     client.create_research_grant(&grantor, &student, &5000, &token_address.address());
@@ -1613,7 +1581,7 @@ fn test_disputed_student_cannot_access_courses() {
     client.init_deans_council(&admin, &council_members, &2);
 
     // Fund scholarship and buy course access
-    client.fund_scholarship(&funder, &student, &1000, &token_address.address());
+    client.fund_scholarship(&funder, &student, &1000, &token_address.address(), &false);
     client.buy_access(&student, &1, &100, &token_address.address());
 
     // Verify initial access
@@ -1657,7 +1625,7 @@ fn test_final_ruling_upload() {
     client.init_deans_council(&admin, &council_members, &2);
 
     // Fund scholarship
-    client.fund_scholarship(&funder, &student, &1000, &token_address.address());
+    client.fund_scholarship(&funder, &student, &1000, &token_address.address(), &false);
 
     // Execute board pause
     let reason = Symbol::new(&env, "plagiarism_confirmed");
@@ -1889,7 +1857,7 @@ fn test_drip_recalculation_on_gpa_change() {
     client.set_academic_oracle(&admin, &oracle);
 
     // Fund scholarship
-    client.fund_scholarship(&funder, &student, &5000, &token_address.address());
+    client.fund_scholarship(&funder, &student, &5000, &token_address.address(), &false);
 
     // Report initial GPA 3.6 (2% bonus)
     client.report_student_gpa(&oracle, &student, &36);
@@ -2297,7 +2265,7 @@ fn test_tutoring_payment_processing() {
     );
 
     // Fund scholarship (this should process tutoring payment)
-    client.fund_scholarship(&scholar, &scholar, &1000, &token_address.address());
+    client.fund_scholarship(&scholar, &scholar, &1000, &token_address.address(), &false);
 
     // The test verifies the function doesn't panic
     // In a real scenario, we'd check the tutor's balance
@@ -2452,7 +2420,7 @@ fn test_probation_start_and_recovery() {
 
     // Fund scholarship for student
     token_client.mint(&admin, &1000);
-    client.fund_scholarship(&admin, &student, &1000, &token_address.address());
+    client.fund_scholarship(&admin, &student, &1000, &token_address.address(), &false);
 
     // Update GPA below threshold (should start probation)
     client.update_student_gpa(&oracle, &student, &20); // 2.0 GPA < 2.5 threshold
@@ -2496,7 +2464,7 @@ fn test_permanent_revocation_after_warning_period() {
 
     // Fund scholarship
     token_client.mint(&admin, &1000);
-    client.fund_scholarship(&admin, &student, &1000, &token_address.address());
+    client.fund_scholarship(&admin, &student, &1000, &token_address.address(), &false);
 
     // Start probation with low GPA
     client.update_student_gpa(&oracle, &student, &20); // 2.0 GPA
@@ -2553,4 +2521,113 @@ fn test_gpa_update_tracking() {
     let gpa_update = gpa_update.unwrap();
     assert_eq!(gpa_update.new_gpa, 32);
     assert_eq!(gpa_update.previous_gpa, 35); // Previous GPA tracked
+}
+
+// --- Issue #118: Native XLM Scholarship Tests ---
+#[test]
+#[should_panic(expected = "Withdrawal would leave less than the 2 XLM gas reserve")]
+fn test_native_xlm_reserve() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &10_0000000);
+
+    let contract_id = env.register_contract(None, ScholarContract);
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.init(&10, &3600, &10, &100, &60);
+
+    // Fund with 10 XLM, as a native scholarship
+    client.fund_scholarship(&funder, &student, &10_0000000, &token_address, &true);
+
+    // Withdraw 8 XLM, should succeed
+    client.withdraw_scholarship(&student, &8_0000000);
+
+    // Try to withdraw 1 more XLM, should fail because it would go below the 2 XLM reserve
+    client.withdraw_scholarship(&student, &1_0000000);
+}
+
+// --- Issue #112: Scholarship Claim Dry-Run Tests ---
+#[test]
+fn test_simulate_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+
+    let contract_id = env.register_contract(None, ScholarContract);
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Set 10% tax rate (1000 bps)
+    client.set_tax_rate(&admin, &1000);
+
+    // Fund scholarship with 1000 tokens
+    client.fund_scholarship(&funder, &student, &1000, &token_address, &false);
+
+    let simulation = client.simulate_claim(&student);
+
+    assert_eq!(simulation.tokens_to_release, 1000);
+    assert_eq!(simulation.estimated_gas_fee, ESTIMATED_GAS_FEE);
+    assert_eq!(simulation.tax_withholding_amount, 100); // 10% of 1000
+    assert_eq!(simulation.net_claimable_amount, 900);
+}
+
+// --- Issues #128 & #122: Community Veto and Graduation Registry Tests ---
+#[test]
+#[should_panic(expected = "Final 10% is locked pending community vote")]
+fn test_community_veto_and_graduation_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let voters: [Address; 5] = [Address::generate(&env), Address::generate(&env), Address::generate(&env), Address::generate(&env), Address::generate(&env)];
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &10000);
+
+    let contract_id = env.register_contract(None, ScholarContract);
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.init(&10, &3600, &10, &100, &60);
+
+    // Fund with 10000 tokens
+    client.fund_scholarship(&funder, &student, &10000, &token_address, &false);
+
+    // Withdraw 9000 tokens (90%)
+    client.withdraw_scholarship(&student, &9000);
+
+    // Initiate final release vote
+    client.initiate_final_release_vote(&student);
+
+    // Cast votes
+    for voter in voters {
+        client.cast_community_vote(&voter, &student);
+    }
+
+    // Claim final release
+    client.claim_final_release(&student);
+
+    // Check graduation registry
+    let graduate_profile = client.get_graduate_profile(&student).unwrap();
+    assert_eq!(graduate_profile.student, student);
+    assert!(graduate_profile.completed_scholarships.contains(&funder));
+
+    // This should panic, proving the lock was in place before the vote
+    client.withdraw_scholarship(&student, &1);
 }

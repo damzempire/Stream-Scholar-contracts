@@ -25,6 +25,17 @@ const PROBATION_WARNING_PERIOD: u64 = 5184000; // 60 days in seconds
 const PROBATION_FLOW_REDUCTION: u64 = 30; // 30% reduction
 const GPA_THRESHOLD: u64 = 25; // 2.5 GPA threshold (stored as 25)
 
+// Issue #128: Community Governance Veto
+const FINAL_RELEASE_PERCENTAGE: u64 = 10; // 10%
+const COMMUNITY_VOTE_THRESHOLD: u64 = 5; // 5 votes to pass
+
+// Issue #118: Native XLM Scholarship
+const NATIVE_XLM_RESERVE: i128 = 2_0000000; // 2 XLM in stroops
+
+// Issue #112: Scholarship Claim Dry-Run
+const DEFAULT_TAX_RATE_BPS: u32 = 0; // 0% default tax
+const ESTIMATED_GAS_FEE: i128 = 500000; // 0.05 XLM in stroops
+
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -64,6 +75,7 @@ pub struct Access {
 #[contracttype]
 #[derive(Clone)]
 pub struct Scholarship {
+    pub funder: Address,
     pub balance: i128,
     pub token: Address,
     pub unlocked_balance: i128,
@@ -72,6 +84,11 @@ pub struct Scholarship {
     pub is_disputed: bool,
     pub dispute_reason: Option<Symbol>,
     pub final_ruling: Option<Symbol>,
+    // Issue #118
+    pub is_native: bool,
+    // Issue #128
+    pub total_grant: i128,
+    pub final_release_claimed: bool,
 }
 
 // Issue #92: Anonymized Leaderboard for Top Scholars structs
@@ -240,6 +257,12 @@ pub enum DataKey {
     AgreementSignature(u64, Address), // agreement_id, signer -> AgreementSignature struct
     StudentPrimaryAgreement(Address), // student -> (agreement_id, primary_language)
     LanguageVersionHash(Bytes), // document_hash -> LanguageVersion metadata
+    // Issue #128: Community Governance Veto
+    CommunityVote(Address), // student -> CommunityVote
+    // Issue #112: Scholarship Claim Dry-Run
+    TaxRate,
+    // Issue #122: On-Chain Graduation Credential Registry
+    GraduationRegistry(Address), // student -> GraduateProfile
 }
 
 #[contracttype]
@@ -288,6 +311,37 @@ pub struct StudentGPA {
     pub gpa: u64, // Stored as integer (e.g., 3.7 = 37)
     pub last_updated: u64,
     pub oracle_verified: bool,
+}
+
+// Issue #128: Community Governance Veto
+#[contracttype]
+#[derive(Clone)]
+pub struct CommunityVote {
+    pub student: Address,
+    pub yes_votes: u64,
+    pub voters: Vec<Address>,
+    pub is_passed: bool,
+    pub created_at: u64,
+}
+
+// Issue #112: Scholarship Claim Dry-Run
+#[contracttype]
+#[derive(Clone)]
+pub struct ClaimSimulation {
+    pub tokens_to_release: i128,
+    pub estimated_gas_fee: i128,
+    pub tax_withholding_amount: i128,
+    pub net_claimable_amount: i128,
+}
+
+// Issue #122: On-Chain Graduation Credential Registry
+#[contracttype]
+#[derive(Clone)]
+pub struct GraduateProfile {
+    pub student: Address,
+    pub graduation_date: u64,
+    pub final_gpa: u64,
+    pub completed_scholarships: Vec<Address>, // List of funder addresses
 }
 
 // Multi-Sig Academic Board Review structs
@@ -886,6 +940,7 @@ impl ScholarContract {
         student: Address,
         amount: i128,
         token: Address,
+        is_native: bool, // For Issue #118
     ) {
         funder.require_auth();
 
@@ -905,21 +960,27 @@ impl ScholarContract {
             .persistent()
             .get(&DataKey::Scholarship(student.clone()))
             .unwrap_or(Scholarship {
+                funder: funder.clone(),
                 balance: 0,
-                token,
+                token: token.clone(),
                 unlocked_balance: 0,
                 last_verif: 0,
                 is_paused: false,
                 is_disputed: false,
                 dispute_reason: None,
                 final_ruling: None,
+                is_native, // Issue #118
+                total_grant: 0, // Issue #128
+                final_release_claimed: false, // Issue #128
             });
 
         // Only add the student's portion to scholarship balance after processing tutoring redirects
-        let final_student_amount = Self::process_tutoring_payment(env.clone(), student.clone(), student_amount, token);
+        let final_student_amount = Self::process_tutoring_payment(env.clone(), student.clone(), student_amount, &token);
         
         scholarship.balance += final_student_amount;
         scholarship.unlocked_balance += final_student_amount; // Assume funded amount is unlocked
+        scholarship.total_grant += final_student_amount; // Issue #128: Track total grant
+        scholarship.is_native = is_native; // Issue #118: Set native flag
         
         env.storage()
             .persistent()
@@ -935,6 +996,180 @@ impl ScholarContract {
             ),
             (amount, university_amount, student_amount)
         );
+    }
+
+    pub fn withdraw_scholarship(env: Env, student: Address, amount: i128) {
+        student.require_auth();
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if scholarship.is_paused || scholarship.is_disputed {
+            panic!("Scholarship is paused or disputed");
+        }
+
+        // Issue #128: Check for final release lock
+        let locked_amount = (scholarship.total_grant * FINAL_RELEASE_PERCENTAGE as i128) / 100;
+        if scholarship.balance <= locked_amount && !scholarship.final_release_claimed {
+            panic!("Final 10% is locked pending community vote");
+        }
+
+        let mut available_to_withdraw = scholarship.unlocked_balance;
+
+        // Issue #128: Prevent withdrawing into the locked 10%
+        if !scholarship.final_release_claimed && scholarship.total_grant > 0 {
+            if scholarship.balance > locked_amount {
+                available_to_withdraw =
+                    core::cmp::min(available_to_withdraw, scholarship.balance - locked_amount);
+            } else {
+                available_to_withdraw = 0;
+            }
+        }
+
+        if amount > available_to_withdraw {
+            panic!("Amount exceeds available unlocked balance");
+        }
+
+        // Issue #118: Native XLM Reserve
+        if scholarship.is_native {
+            if scholarship.balance - amount < NATIVE_XLM_RESERVE {
+                panic!("Withdrawal would leave less than the 2 XLM gas reserve");
+            }
+        }
+
+        if scholarship.balance < amount {
+            panic!("Insufficient balance");
+        }
+
+        // Issue #112: Apply tax
+        let tax_rate_bps: u32 = env.storage().instance().get(&DataKey::TaxRate).unwrap_or(0);
+        let tax_amount = (amount * tax_rate_bps as i128) / 10000;
+        let net_amount = amount - tax_amount;
+
+        scholarship.balance -= amount;
+        scholarship.unlocked_balance -= amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        // Transfer to student
+        let client = token::Client::new(&env, &scholarship.token);
+        client.transfer(&env.current_contract_address(), &student, &net_amount);
+
+        // Note: Tax amount is currently held by the contract. A treasury address could be added.
+    }
+
+    // --- Issue #112: Scholarship_Simulate_Claim_Dry-Run_Helper ---
+    pub fn set_tax_rate(env: Env, admin: Address, rate_bps: u32) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+        if rate_bps > 10000 {
+            panic!("Tax rate cannot exceed 100%");
+        }
+        env.storage().instance().set(&DataKey::TaxRate, &rate_bps);
+    }
+
+    pub fn simulate_claim(env: Env, student: Address) -> ClaimSimulation {
+        let scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .unwrap_or_else(|| {
+                // Return zero-value simulation if no scholarship found
+                return ClaimSimulation {
+                    tokens_to_release: 0,
+                    estimated_gas_fee: ESTIMATED_GAS_FEE,
+                    tax_withholding_amount: 0,
+                    net_claimable_amount: 0,
+                };
+            });
+
+        if scholarship.is_paused || scholarship.is_disputed {
+            return ClaimSimulation {
+                tokens_to_release: 0,
+                estimated_gas_fee: ESTIMATED_GAS_FEE,
+                tax_withholding_amount: 0,
+                net_claimable_amount: 0,
+            };
+        }
+
+        let mut tokens_to_release = scholarship.unlocked_balance;
+
+        // Issue #128 logic
+        if !scholarship.final_release_claimed && scholarship.total_grant > 0 {
+            let locked_amount = (scholarship.total_grant * FINAL_RELEASE_PERCENTAGE as i128) / 100;
+            if scholarship.balance > locked_amount {
+                tokens_to_release =
+                    core::cmp::min(tokens_to_release, scholarship.balance - locked_amount);
+            } else {
+                tokens_to_release = 0;
+            }
+        }
+
+        // Issue #118 logic
+        if scholarship.is_native {
+            if scholarship.balance > NATIVE_XLM_RESERVE {
+                tokens_to_release =
+                    core::cmp::min(tokens_to_release, scholarship.balance - NATIVE_XLM_RESERVE);
+            } else {
+                tokens_to_release = 0;
+            }
+        }
+
+        if tokens_to_release < 0 {
+            tokens_to_release = 0;
+        }
+
+        let tax_rate_bps: u32 = env.storage().instance().get(&DataKey::TaxRate).unwrap_or(0);
+        let tax_withholding_amount = (tokens_to_release * tax_rate_bps as i128) / 10000;
+        let net_claimable_amount = tokens_to_release - tax_withholding_amount;
+
+        ClaimSimulation {
+            tokens_to_release,
+            estimated_gas_fee: ESTIMATED_GAS_FEE,
+            tax_withholding_amount,
+            net_claimable_amount,
+        }
+    }
+
+    // --- Issue #128: Community_Governance_Veto_on_Final_Graduation_Release ---
+    pub fn initiate_final_release_vote(env: Env, student: Address) {
+        student.require_auth();
+
+        let scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        let locked_amount = (scholarship.total_grant * FINAL_RELEASE_PERCENTAGE as i128) / 100;
+        if scholarship.balance > locked_amount || scholarship.final_release_claimed {
+            panic!("Final release vote cannot be initiated yet");
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::CommunityVote(student.clone()))
+        {
+            panic!("Vote already initiated");
+        }
+
+        let vote = CommunityVote {
+            student: student.clone(),
+            yes_votes: 0,
+            voters: Vec::new(&env),
+            is_passed: false,
+            created_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommunityVote(student.clone()), &vote);
     }
 
     pub fn transfer_scholarship_to_teacher(
@@ -2963,6 +3198,135 @@ impl ScholarContract {
             (Symbol::new(&env, "AgreementDeactivated"), admin),
             agreement_id
         );
+    }
+
+    pub fn cast_community_vote(env: Env, voter: Address, student: Address) {
+        voter.require_auth();
+
+        let mut vote: CommunityVote = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommunityVote(student.clone()))
+            .expect("No vote initiated for this student");
+
+        if vote.is_passed {
+            panic!("Vote has already passed");
+        }
+        if vote.voters.contains(&voter) {
+            panic!("Voter has already voted");
+        }
+
+        vote.voters.push_back(voter);
+        vote.yes_votes += 1;
+
+        if vote.yes_votes >= COMMUNITY_VOTE_THRESHOLD {
+            vote.is_passed = true;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommunityVote(student.clone()), &vote);
+    }
+
+    pub fn claim_final_release(env: Env, student: Address) {
+        student.require_auth();
+
+        let vote: CommunityVote = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommunityVote(student.clone()))
+            .expect("No vote found for this student");
+
+        if !vote.is_passed {
+            panic!("Community vote has not passed");
+        }
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if scholarship.final_release_claimed {
+            panic!("Final release already claimed");
+        }
+
+        let locked_amount = (scholarship.total_grant * FINAL_RELEASE_PERCENTAGE as i128) / 100;
+        if scholarship.balance > locked_amount {
+            panic!("Final release not yet locked");
+        }
+
+        let amount_to_release = scholarship.balance;
+
+        if amount_to_release <= 0 {
+            panic!("No balance to claim");
+        }
+
+        // Issue #118: Native XLM Reserve still applies
+        if scholarship.is_native {
+            if amount_to_release < NATIVE_XLM_RESERVE {
+                panic!("Final balance is less than gas reserve");
+            }
+            let final_claim = amount_to_release - NATIVE_XLM_RESERVE;
+            scholarship.balance -= final_claim;
+            scholarship.unlocked_balance -= final_claim;
+
+            let client = token::Client::new(&env, &scholarship.token);
+            client.transfer(&env.current_contract_address(), &student, &final_claim);
+        } else {
+            scholarship.balance = 0;
+            scholarship.unlocked_balance = 0;
+            let client = token::Client::new(&env, &scholarship.token);
+            client.transfer(&env.current_contract_address(), &student, &amount_to_release);
+        }
+
+        scholarship.final_release_claimed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        // Issue #122: Mark as graduated
+        Self::mark_as_graduated(env, student.clone(), scholarship.funder.clone());
+    }
+
+    // --- Issue #122: On-Chain_Graduation_Credential_Registry ---
+    fn mark_as_graduated(env: Env, student: Address, funder: Address) {
+        // This is an internal function called upon final claim
+        let mut profile: GraduateProfile = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GraduationRegistry(student.clone()))
+            .unwrap_or(GraduateProfile {
+                student: student.clone(),
+                graduation_date: env.ledger().timestamp(),
+                final_gpa: 0,
+                completed_scholarships: Vec::new(&env),
+            });
+
+        if !profile.completed_scholarships.contains(&funder) {
+            profile.completed_scholarships.push_back(funder);
+        }
+
+        // Get final GPA
+        if let Some(gpa_data) = env
+            .storage()
+            .persistent()
+            .get::<_, StudentGPA>(&DataKey::StudentGPA(student.clone()))
+        {
+            profile.final_gpa = gpa_data.gpa;
+        }
+
+        profile.graduation_date = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::GraduationRegistry(student.clone()), &profile);
+    }
+
+    pub fn get_graduate_profile(env: Env, student: Address) -> Option<GraduateProfile> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GraduationRegistry(student))
     }
 
     }
