@@ -1,0 +1,47 @@
+{
+  "name": "stream-scholar-contracts",
+  "version": "1.0.0",
+  "description": "Stellar-native NFT contracts for Stream-Scholar student profiles",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "jest",
+    "test:nft": "jest tests/nft-integration.test.js",
+    "build": "webpack --mode production",
+    "dev": "webpack serve --mode development",
+    "deploy": "node scripts/deploy.js",
+    "deploy:nft": "node scripts/deploy-nft.js",
+    "mint": "node scripts/mint-nft.js",
+    "mint:enhanced": "node scripts/mint-nft-enhanced.js",
+    "mint:demo": "node scripts/mint-nft-enhanced.js demo"
+  },
+  "keywords": [
+    "stellar",
+    "nft",
+    "blockchain",
+    "education",
+    "student-profile",
+    "stream-scholar"
+  ],
+  "author": "Damz Empire",
+  "license": "MIT",
+  "dependencies": {
+    "@stellar/stellar-sdk": "^12.0.0",
+    "@stellar/stellar-base": "^12.0.0",
+    "web3": "^4.0.0",
+    "axios": "^1.6.0",
+    "crypto-js": "^4.2.0"
+  },
+  "devDependencies": {
+    "webpack": "^5.89.0",
+    "webpack-cli": "^5.1.0",
+    "webpack-dev-server": "^4.15.0",
+    "html-webpack-plugin": "^5.5.0",
+    "css-loader": "^6.8.0",
+    "style-loader": "^3.3.0",
+    "babel-loader": "^9.1.0",
+    "@babel/core": "^7.23.0",
+    "@babel/preset-env": "^7.23.0",
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.0"
+  }
+}

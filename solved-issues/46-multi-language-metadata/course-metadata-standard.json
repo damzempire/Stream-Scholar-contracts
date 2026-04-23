@@ -1,0 +1,542 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/akordavid373/Stream-Scholar-contracts/docs/course-metadata-standard.json",
+  "title": "Course Metadata Standard",
+  "description": "Standard JSON schema for course descriptions, thumbnails, and durations to be stored on IPFS",
+  "type": "object",
+  "required": [
+    "courseId",
+    "title",
+    "description",
+    "instructor",
+    "duration",
+    "thumbnail",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "courseId": {
+      "type": "string",
+      "description": "Unique identifier for the course",
+      "pattern": "^[a-zA-Z0-9_-]+$",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "title": {
+      "type": "string",
+      "description": "Course title",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "description": {
+      "type": "string",
+      "description": "Detailed description of the course content",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "instructor": {
+      "type": "object",
+      "description": "Instructor information",
+      "required": ["name", "address"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Instructor's display name",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "address": {
+          "type": "string",
+          "description": "Instructor's wallet address (Stellar address)",
+          "pattern": "^G[A-Z0-9]{55}$"
+        },
+        "bio": {
+          "type": "string",
+          "description": "Optional instructor biography",
+          "maxLength": 500
+        },
+        "avatar": {
+          "type": "string",
+          "description": "IPFS CID for instructor's avatar image",
+          "pattern": "^Qm[1-9A-HJ-NP-Za-km-z]{44,}$|^b[A-Za-z2-7]{58,}$"
+        }
+      }
+    },
+    "duration": {
+      "type": "object",
+      "description": "Course duration information",
+      "required": ["totalMinutes"],
+      "properties": {
+        "totalMinutes": {
+          "type": "integer",
+          "description": "Total course duration in minutes",
+          "minimum": 1,
+          "maximum": 50000
+        },
+        "estimatedHours": {
+          "type": "number",
+          "description": "Estimated duration in hours (calculated as totalMinutes / 60)",
+          "minimum": 0.0167
+        },
+        "format": {
+          "type": "string",
+          "description": "Duration format for display",
+          "enum": ["hours", "minutes", "mixed"]
+        }
+      }
+    },
+    "thumbnail": {
+      "type": "object",
+      "description": "Course thumbnail information",
+      "required": ["ipfsCid"],
+      "properties": {
+        "ipfsCid": {
+          "type": "string",
+          "description": "IPFS CID for the thumbnail image",
+          "pattern": "^Qm[1-9A-HJ-NP-Za-km-z]{44,}$|^b[A-Za-z2-7]{58,}$"
+        },
+        "mimeType": {
+          "type": "string",
+          "description": "MIME type of the thumbnail image",
+          "enum": ["image/jpeg", "image/png", "image/webp", "image/gif"]
+        },
+        "dimensions": {
+          "type": "object",
+          "description": "Image dimensions",
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            }
+          }
+        },
+        "fileSize": {
+          "type": "integer",
+          "description": "File size in bytes",
+          "minimum": 1,
+          "maximum": 10485760
+        }
+      }
+    },
+    "category": {
+      "type": "object",
+      "description": "Course categorization",
+      "properties": {
+        "primary": {
+          "type": "string",
+          "description": "Primary category",
+          "enum": [
+            "programming",
+            "blockchain",
+            "design",
+            "business",
+            "mathematics",
+            "science",
+            "language",
+            "arts",
+            "other"
+          ]
+        },
+        "secondary": {
+          "type": "string",
+          "description": "Secondary category (optional)",
+          "enum": [
+            "programming",
+            "blockchain",
+            "design",
+            "business",
+            "mathematics",
+            "science",
+            "language",
+            "arts",
+            "other"
+          ]
+        },
+        "tags": {
+          "type": "array",
+          "description": "Array of course tags",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 50
+          },
+          "maxItems": 10
+        }
+      }
+    },
+    "difficulty": {
+      "type": "string",
+      "description": "Course difficulty level",
+      "enum": ["beginner", "intermediate", "advanced", "expert"]
+    },
+    "language": {
+      "type": "string",
+      "description": "Course language (ISO 639-1 code)",
+      "pattern": "^[a-z]{2}$",
+      "default": "en"
+    },
+    "multi_language_metadata": {
+      "type": "object",
+      "description": "Multi-language metadata support for different language versions",
+      "properties": {
+        "default_language": {
+          "type": "string",
+          "description": "Default language code (ISO 639-1)",
+          "pattern": "^[a-z]{2}$",
+          "default": "en"
+        },
+        "available_languages": {
+          "type": "array",
+          "description": "List of available language codes",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z]{2}$"
+          },
+          "minItems": 1
+        },
+        "metadata_links": {
+          "type": "object",
+          "description": "IPFS links for different language versions of course metadata",
+          "patternProperties": {
+            "^[a-z]{2}$": {
+              "type": "object",
+              "description": "Language-specific metadata",
+              "required": ["ipfs_cid", "title"],
+              "properties": {
+                "ipfs_cid": {
+                  "type": "string",
+                  "description": "IPFS CID for the language-specific metadata JSON",
+                  "pattern": "^Qm[1-9A-HJ-NP-Za-km-z]{44,}$|^b[A-Za-z2-7]{58,}$"
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Course title in this language",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "description": {
+                  "type": "string",
+                  "description": "Course description in this language",
+                  "minLength": 1,
+                  "maxLength": 2000
+                },
+                "thumbnail": {
+                  "type": "object",
+                  "description": "Language-specific thumbnail information",
+                  "required": ["ipfs_cid"],
+                  "properties": {
+                    "ipfs_cid": {
+                      "type": "string",
+                      "description": "IPFS CID for the language-specific thumbnail image",
+                      "pattern": "^Qm[1-9A-HJ-NP-Za-km-z]{44,}$|^b[A-Za-z2-7]{58,}$"
+                    },
+                    "mimeType": {
+                      "type": "string",
+                      "description": "MIME type of the thumbnail image",
+                      "enum": ["image/jpeg", "image/png", "image/webp", "image/gif"]
+                    },
+                    "dimensions": {
+                      "type": "object",
+                      "description": "Image dimensions",
+                      "properties": {
+                        "width": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 4096
+                        },
+                        "height": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 4096
+                        }
+                      }
+                    },
+                    "fileSize": {
+                      "type": "integer",
+                      "description": "File size in bytes",
+                      "minimum": 1,
+                      "maximum": 10485760
+                    }
+                  }
+                },
+                "learning_objectives": {
+                  "type": "array",
+                  "description": "Learning objectives in this language",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "maxItems": 10
+                },
+                "last_updated": {
+                  "type": "string",
+                  "description": "Timestamp when this language version was last updated (ISO 8601 format)",
+                  "format": "date-time"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": ["default_language", "available_languages", "metadata_links"]
+    },
+    "price": {
+      "type": "object",
+      "description": "Course pricing information",
+      "properties": {
+        "amount": {
+          "type": "string",
+          "description": "Price amount in smallest currency unit (e.g., stroops for XLM)",
+          "pattern": "^[0-9]+$"
+        },
+        "currency": {
+          "type": "string",
+          "description": "Currency code",
+          "enum": ["XLM", "USDC", "ETH"],
+          "default": "XLM"
+        },
+        "isFree": {
+          "type": "boolean",
+          "description": "Whether the course is free",
+          "default": false
+        }
+      }
+    },
+    "prerequisites": {
+      "type": "array",
+      "description": "List of prerequisite course IDs",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-zA-Z0-9_-]+$"
+      },
+      "maxItems": 10
+    },
+    "learningObjectives": {
+      "type": "array",
+      "description": "Learning objectives for the course",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "maxItems": 10
+    },
+    "createdAt": {
+      "type": "string",
+      "description": "Timestamp when the course was created (ISO 8601 format)",
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": "string",
+      "description": "Timestamp when the course was last updated (ISO 8601 format)",
+      "format": "date-time"
+    },
+    "version": {
+      "type": "string",
+      "description": "Version of the metadata schema",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "default": "1.0.0"
+    },
+    "status": {
+      "type": "string",
+      "description": "Course publication status",
+      "enum": ["draft", "published", "archived", "deprecated"],
+      "default": "draft"
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "courseId": "intro-to-rust-101",
+      "title": "Introduction to Rust Programming",
+      "description": "Learn the fundamentals of Rust programming language, including ownership, borrowing, and memory safety.",
+      "instructor": {
+        "name": "Alice Johnson",
+        "address": "GD5JJ3STX5U5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5",
+        "bio": "Senior Rust developer with 10+ years of experience",
+        "avatar": "QmXxx... (IPFS CID)"
+      },
+      "duration": {
+        "totalMinutes": 480,
+        "estimatedHours": 8,
+        "format": "hours"
+      },
+      "thumbnail": {
+        "ipfsCid": "QmYyy... (IPFS CID)",
+        "mimeType": "image/jpeg",
+        "dimensions": {
+          "width": 1280,
+          "height": 720
+        },
+        "fileSize": 245760
+      },
+      "category": {
+        "primary": "programming",
+        "secondary": "blockchain",
+        "tags": ["rust", "programming", "blockchain", "memory-safety"]
+      },
+      "difficulty": "beginner",
+      "language": "en",
+      "price": {
+        "amount": "10000000",
+        "currency": "XLM",
+        "isFree": false
+      },
+      "prerequisites": [],
+      "learningObjectives": [
+        "Understand Rust's ownership system",
+        "Master borrowing and references",
+        "Write safe concurrent Rust code"
+      ],
+      "createdAt": "2024-03-25T10:00:00Z",
+      "updatedAt": "2024-03-25T10:00:00Z",
+      "version": "1.0.0",
+      "status": "published"
+    },
+    {
+      "courseId": "advanced-blockchain-201",
+      "title": "Advanced Blockchain Development",
+      "description": "Master advanced blockchain concepts and smart contract development.",
+      "instructor": {
+        "name": "Bob Chen",
+        "address": "GD5JJ3STX5U5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5XK5",
+        "bio": "Blockchain architect with 8+ years of experience"
+      },
+      "duration": {
+        "totalMinutes": 720,
+        "estimatedHours": 12,
+        "format": "hours"
+      },
+      "thumbnail": {
+        "ipfsCid": "QmZzz... (IPFS CID)",
+        "mimeType": "image/webp",
+        "dimensions": {
+          "width": 1280,
+          "height": 720
+        },
+        "fileSize": 384000
+      },
+      "category": {
+        "primary": "blockchain",
+        "secondary": "programming",
+        "tags": ["blockchain", "smart-contracts", "defi", "web3"]
+      },
+      "difficulty": "advanced",
+      "language": "en",
+      "multi_language_metadata": {
+        "default_language": "en",
+        "available_languages": ["en", "es", "zh", "fr"],
+        "metadata_links": {
+          "en": {
+            "ipfs_cid": "QmEn123... (English metadata IPFS CID)",
+            "title": "Advanced Blockchain Development",
+            "description": "Master advanced blockchain concepts and smart contract development.",
+            "thumbnail": {
+              "ipfs_cid": "QmEnThumb... (English thumbnail IPFS CID)",
+              "mimeType": "image/webp",
+              "dimensions": {
+                "width": 1280,
+                "height": 720
+              },
+              "fileSize": 384000
+            },
+            "learning_objectives": [
+              "Understand advanced consensus mechanisms",
+              "Build complex smart contracts",
+              "Implement DeFi protocols",
+              "Master cross-chain interoperability"
+            ],
+            "last_updated": "2024-03-25T10:00:00Z"
+          },
+          "es": {
+            "ipfs_cid": "QmEs456... (Spanish metadata IPFS CID)",
+            "title": "Desarrollo Avanzado de Blockchain",
+            "description": "Domina conceptos avanzados de blockchain y desarrollo de contratos inteligentes.",
+            "thumbnail": {
+              "ipfs_cid": "QmEsThumb... (Spanish thumbnail IPFS CID)",
+              "mimeType": "image/webp",
+              "dimensions": {
+                "width": 1280,
+                "height": 720
+              },
+              "fileSize": 392000
+            },
+            "learning_objectives": [
+              "Comprender mecanismos de consenso avanzados",
+              "Construir contratos inteligentes complejos",
+              "Implementar protocolos DeFi",
+              "Dominar la interoperabilidad entre cadenas"
+            ],
+            "last_updated": "2024-03-25T10:00:00Z"
+          },
+          "zh": {
+            "ipfs_cid": "QmZh789... (Chinese metadata IPFS CID)",
+            "title": "高级区块链开发",
+            "description": "掌握高级区块链概念和智能合约开发。",
+            "thumbnail": {
+              "ipfs_cid": "QmZhThumb... (Chinese thumbnail IPFS CID)",
+              "mimeType": "image/webp",
+              "dimensions": {
+                "width": 1280,
+                "height": 720
+              },
+              "fileSize": 376000
+            },
+            "learning_objectives": [
+              "理解高级共识机制",
+              "构建复杂的智能合约",
+              "实现DeFi协议",
+              "掌握跨链互操作性"
+            ],
+            "last_updated": "2024-03-25T10:00:00Z"
+          },
+          "fr": {
+            "ipfs_cid": "QmFr012... (French metadata IPFS CID)",
+            "title": "Développement Avancé Blockchain",
+            "description": "Maîtrisez les concepts avancés de blockchain et le développement de contrats intelligents.",
+            "thumbnail": {
+              "ipfs_cid": "QmFrThumb... (French thumbnail IPFS CID)",
+              "mimeType": "image/webp",
+              "dimensions": {
+                "width": 1280,
+                "height": 720
+              },
+              "fileSize": 380000
+            },
+            "learning_objectives": [
+              "Comprendre les mécanismes de consensus avancés",
+              "Construire des contrats intelligents complexes",
+              "Mettre en œuvre des protocoles DeFi",
+              "Maîtriser l'interopérabilité multi-chaînes"
+            ],
+            "last_updated": "2024-03-25T10:00:00Z"
+          }
+        }
+      },
+      "price": {
+        "amount": "15000000",
+        "currency": "XLM",
+        "isFree": false
+      },
+      "prerequisites": ["intro-to-rust-101"],
+      "learningObjectives": [
+        "Understand advanced consensus mechanisms",
+        "Build complex smart contracts",
+        "Implement DeFi protocols",
+        "Master cross-chain interoperability"
+      ],
+      "createdAt": "2024-03-25T10:00:00Z",
+      "updatedAt": "2024-03-25T10:00:00Z",
+      "version": "1.0.0",
+      "status": "published"
+    }
+  ]
+}

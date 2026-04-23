@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream-Scholar Student Profile NFT</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@stellar/stellar-sdk@latest/dist/stellar-sdk.min.js"></script>
+    <style>
+        .nft-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .level-badge {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        .achievement-icon {
+            transition: transform 0.2s;
+        }
+        .achievement-icon:hover {
+            transform: scale(1.1);
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+    <!-- Navigation -->
+    <nav class="bg-gray-800 border-b border-gray-700">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <div class="flex items-center">
+                    <h1 class="text-xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">
+                        🎓 Stream-Scholar NFT
+                    </h1>
+                </div>
+                <div class="flex space-x-4">
+                    <button onclick="connectWallet()" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg transition">
+                        Connect Wallet
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <!-- Wallet Connection Status -->
+        <div id="walletStatus" class="mb-8 p-4 bg-gray-800 rounded-lg border border-gray-700">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-sm text-gray-400">Wallet Status</p>
+                    <p id="walletAddress" class="font-mono text-sm">Not connected</p>
+                </div>
+                <div id="connectionIndicator" class="w-3 h-3 bg-red-500 rounded-full"></div>
+            </div>
+        </div>
+
+        <!-- Student Profile Section -->
+        <div id="profileSection" class="hidden">
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                <!-- NFT Card -->
+                <div class="lg:col-span-1">
+                    <div class="nft-card rounded-xl p-6 shadow-2xl">
+                        <div class="text-center">
+                            <div id="nftImage" class="w-48 h-48 mx-auto mb-4 rounded-lg bg-white/10 flex items-center justify-center">
+                                <div class="text-6xl">🎓</div>
+                            </div>
+                            <h2 id="studentName" class="text-2xl font-bold mb-2">Student Name</h2>
+                            <p id="studentId" class="text-sm opacity-75 mb-4">@student_id</p>
+                            
+                            <!-- Level Badge -->
+                            <div class="level-badge inline-block bg-yellow-500 text-black px-4 py-2 rounded-full font-bold mb-4">
+                                Level <span id="studentLevel">1</span>
+                            </div>
+                            
+                            <!-- XP Progress -->
+                            <div class="mb-4">
+                                <div class="flex justify-between text-sm mb-1">
+                                    <span>XP: <span id="currentXP">0</span></span>
+                                    <span>Next: <span id="nextLevelXP">100</span></span>
+                                </div>
+                                <div class="w-full bg-black/30 rounded-full h-2">
+                                    <div id="xpProgress" class="bg-yellow-400 h-2 rounded-full transition-all duration-500" style="width: 0%"></div>
+                                </div>
+                            </div>
+                            
+                            <!-- Study Streak -->
+                            <div class="flex items-center justify-center space-x-2 text-sm">
+                                <span>🔥</span>
+                                <span><span id="studyStreak">0</span> day streak</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Profile Details -->
+                <div class="lg:col-span-2 space-y-6">
+                    <!-- Stats Grid -->
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <div class="bg-gray-800 rounded-lg p-4 text-center">
+                            <div class="text-2xl font-bold text-blue-400" id="coursesCompleted">0</div>
+                            <div class="text-sm text-gray-400">Courses</div>
+                        </div>
+                        <div class="bg-gray-800 rounded-lg p-4 text-center">
+                            <div class="text-2xl font-bold text-green-400" id="achievementsCount">0</div>
+                            <div class="text-sm text-gray-400">Achievements</div>
+                        </div>
+                        <div class="bg-gray-800 rounded-lg p-4 text-center">
+                            <div class="text-2xl font-bold text-purple-400" id="skillsCount">0</div>
+                            <div class="text-sm text-gray-400">Skills</div>
+                        </div>
+                        <div class="bg-gray-800 rounded-lg p-4 text-center">
+                            <div class="text-2xl font-bold text-yellow-400" id="totalXP">0</div>
+                            <div class="text-sm text-gray-400">Total XP</div>
+                        </div>
+                    </div>
+
+                    <!-- Recent Achievements -->
+                    <div class="bg-gray-800 rounded-lg p-6">
+                        <h3 class="text-xl font-bold mb-4">🏆 Recent Achievements</h3>
+                        <div id="achievementsList" class="space-y-3">
+                            <p class="text-gray-400">No achievements yet. Start learning to earn your first achievement!</p>
+                        </div>
+                    </div>
+
+                    <!-- Recent Courses -->
+                    <div class="bg-gray-800 rounded-lg p-6">
+                        <h3 class="text-xl font-bold mb-4">📚 Recent Courses</h3>
+                        <div id="coursesList" class="space-y-3">
+                            <p class="text-gray-400">No courses completed yet. Enroll in your first course to get started!</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Mint NFT Section -->
+        <div id="mintSection" class="hidden">
+            <div class="max-w-2xl mx-auto">
+                <div class="bg-gray-800 rounded-xl p-8">
+                    <h2 class="text-2xl font-bold mb-6 text-center">Create Your Student Profile NFT</h2>
+                    
+                    <form id="mintForm" class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium mb-2">Student ID</label>
+                            <input type="text" id="mintStudentId" required
+                                class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                placeholder="e.g., alice_wonderland">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium mb-2">Display Name</label>
+                            <input type="text" id="mintName" required
+                                class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                placeholder="Alice Wonderland">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium mb-2">Email</label>
+                            <input type="email" id="mintEmail" required
+                                class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                placeholder="alice@example.com">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium mb-2">Bio</label>
+                            <textarea id="mintBio" rows="3"
+                                class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                placeholder="Tell us about your learning journey..."></textarea>
+                        </div>
+                        
+                        <button type="submit" 
+                            class="w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white font-bold py-3 px-4 rounded-lg transition">
+                            🎓 Mint Student Profile NFT
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- Loading State -->
+        <div id="loadingState" class="hidden text-center py-12">
+            <div class="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
+            <p class="mt-4 text-gray-400">Loading your profile...</p>
+        </div>
+    </main>
+
+    <!-- Notification Toast -->
+    <div id="notification" class="fixed bottom-4 right-4 max-w-sm bg-gray-800 border border-gray-700 rounded-lg p-4 hidden transform transition-all duration-300 translate-y-full">
+        <div class="flex items-center">
+            <div id="notificationIcon" class="flex-shrink-0 mr-3"></div>
+            <div>
+                <p id="notificationTitle" class="font-semibold"></p>
+                <p id="notificationMessage" class="text-sm text-gray-400"></p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global state
+        let wallet = null;
+        let currentProfile = null;
+        let nftIntegration = null;
+
+        // Initialize app
+        document.addEventListener('DOMContentLoaded', () => {
+            // Check if wallet is already connected
+            if (localStorage.getItem('stellarWallet')) {
+                connectWallet();
+            }
+        });
+
+        // Wallet connection
+        async function connectWallet() {
+            try {
+                showLoading(true);
+                
+                // For demo purposes, create a random keypair
+                // In production, integrate with actual wallet like Freighter or Albedo
+                const keypair = StellarSdk.Keypair.random();
+                
+                wallet = {
+                    publicKey: keypair.publicKey(),
+                    secretKey: keypair.secret(),
+                    keypair: keypair
+                };
+
+                // Save to localStorage
+                localStorage.setItem('stellarWallet', JSON.stringify({
+                    publicKey: wallet.publicKey,
+                    secretKey: wallet.secretKey
+                }));
+
+                updateWalletStatus(true);
+                showNotification('success', 'Wallet Connected', `Connected as ${wallet.publicKey}`);
+                
+                // Check if user has existing profile
+                await checkExistingProfile();
+                
+            } catch (error) {
+                console.error('Failed to connect wallet:', error);
+                showNotification('error', 'Connection Failed', error.message);
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        // Update wallet status UI
+        function updateWalletStatus(connected) {
+            const address = document.getElementById('walletAddress');
+            const indicator = document.getElementById('connectionIndicator');
+            
+            if (connected && wallet) {
+                address.textContent = `${wallet.publicKey.slice(0, 8)}...${wallet.publicKey.slice(-8)}`;
+                indicator.className = 'w-3 h-3 bg-green-500 rounded-full';
+            } else {
+                address.textContent = 'Not connected';
+                indicator.className = 'w-3 h-3 bg-red-500 rounded-full';
+            }
+        }
+
+        // Check for existing profile
+        async function checkExistingProfile() {
+            try {
+                // For demo purposes, check if we have a stored profile
+                const storedProfile = localStorage.getItem('studentProfile');
+                
+                if (storedProfile) {
+                    currentProfile = JSON.parse(storedProfile);
+                    showProfile(currentProfile);
+                } else {
+                    showMintForm();
+                }
+                
+            } catch (error) {
+                console.error('Failed to check existing profile:', error);
+                showMintForm();
+            }
+        }
+
+        // Show mint form
+        function showMintForm() {
+            document.getElementById('mintSection').classList.remove('hidden');
+            document.getElementById('profileSection').classList.add('hidden');
+        }
+
+        // Show profile
+        function showProfile(profile) {
+            document.getElementById('mintSection').classList.add('hidden');
+            document.getElementById('profileSection').classList.remove('hidden');
+            
+            // Update profile display
+            document.getElementById('studentName').textContent = profile.personalInfo?.name || 'Student';
+            document.getElementById('studentId').textContent = `@${profile.studentId}`;
+            document.getElementById('studentLevel').textContent = profile.learning?.level || 1;
+            document.getElementById('currentXP').textContent = profile.learning?.totalXP || 0;
+            document.getElementById('studyStreak').textContent = profile.learning?.studyStreak || 0;
+            document.getElementById('coursesCompleted').textContent = profile.learning?.courses?.filter(c => c.completed).length || 0;
+            document.getElementById('achievementsCount').textContent = profile.achievements?.length || 0;
+            document.getElementById('skillsCount').textContent = profile.learning?.skills?.length || 0;
+            document.getElementById('totalXP').textContent = profile.learning?.totalXP || 0;
+            
+            // Update XP progress
+            updateXPProgress(profile.learning?.totalXP || 0, profile.learning?.level || 1);
+            
+            // Update achievements list
+            updateAchievementsList(profile.achievements || []);
+            
+            // Update courses list
+            updateCoursesList(profile.learning?.courses || []);
+        }
+
+        // Update XP progress bar
+        function updateXPProgress(xp, level) {
+            const levels = [0, 100, 250, 500, 1000, 2000, 5000, 10000]; // XP thresholds
+            const currentLevelXP = level > 1 ? levels[level - 2] : 0;
+            const nextLevelXP = level < 8 ? levels[level - 1] : 10000;
+            
+            const progress = level >= 8 ? 100 : ((xp - currentLevelXP) / (nextLevelXP - currentLevelXP)) * 100;
+            
+            document.getElementById('xpProgress').style.width = `${progress}%`;
+            document.getElementById('nextLevelXP').textContent = level >= 8 ? 'MAX' : nextLevelXP;
+        }
+
+        // Update achievements list
+        function updateAchievementsList(achievements) {
+            const container = document.getElementById('achievementsList');
+            
+            if (achievements.length === 0) {
+                container.innerHTML = '<p class="text-gray-400">No achievements yet. Start learning to earn your first achievement!</p>';
+                return;
+            }
+            
+            const recentAchievements = achievements.slice(-5).reverse();
+            container.innerHTML = recentAchievements.map(achievement => `
+                <div class="flex items-center space-x-3 p-3 bg-gray-700 rounded-lg">
+                    <div class="achievement-icon text-2xl">${achievement.icon || '🏆'}</div>
+                    <div class="flex-1">
+                        <div class="font-semibold">${achievement.title}</div>
+                        <div class="text-sm text-gray-400">${achievement.description}</div>
+                    </div>
+                    <div class="text-sm">
+                        <span class="text-yellow-400">+${achievement.xpReward || 0} XP</span>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Update courses list
+        function updateCoursesList(courses) {
+            const container = document.getElementById('coursesList');
+            const completedCourses = courses.filter(c => c.completed);
+            
+            if (completedCourses.length === 0) {
+                container.innerHTML = '<p class="text-gray-400">No courses completed yet. Enroll in your first course to get started!</p>';
+                return;
+            }
+            
+            const recentCourses = completedCourses.slice(-3).reverse();
+            container.innerHTML = recentCourses.map(course => `
+                <div class="flex items-center space-x-3 p-3 bg-gray-700 rounded-lg">
+                    <div class="text-2xl">📚</div>
+                    <div class="flex-1">
+                        <div class="font-semibold">${course.title}</div>
+                        <div class="text-sm text-gray-400">${course.category} • ${course.difficulty}</div>
+                    </div>
+                    <div class="text-sm">
+                        <span class="text-green-400">+${course.xpEarned || 0} XP</span>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Handle mint form submission
+        document.getElementById('mintForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            if (!wallet) {
+                showNotification('error', 'Wallet Required', 'Please connect your wallet first');
+                return;
+            }
+            
+            try {
+                showLoading(true);
+                
+                const studentData = {
+                    studentId: document.getElementById('mintStudentId').value,
+                    personalInfo: {
+                        name: document.getElementById('mintName').value,
+                        email: document.getElementById('mintEmail').value,
+                        bio: document.getElementById('mintBio').value
+                    }
+                };
+                
+                // Create demo profile (in production, this would call actual contract)
+                const newProfile = createDemoProfile(studentData);
+                
+                // Save to localStorage
+                localStorage.setItem('studentProfile', JSON.stringify(newProfile));
+                currentProfile = newProfile;
+                
+                showNotification('success', 'NFT Minted!', `Your Student Profile NFT has been created successfully!`);
+                showProfile(newProfile);
+                
+            } catch (error) {
+                console.error('Failed to mint NFT:', error);
+                showNotification('error', 'Mint Failed', error.message);
+            } finally {
+                showLoading(false);
+            }
+        });
+
+        // Create demo profile (simulates blockchain interaction)
+        function createDemoProfile(studentData) {
+            return {
+                studentId: studentData.studentId,
+                personalInfo: studentData.personalInfo,
+                learning: {
+                    totalXP: 0,
+                    level: 1,
+                    courses: [],
+                    skills: [],
+                    studyStreak: 0,
+                    lastStudyDate: null
+                },
+                achievements: [],
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+            };
+        }
+
+        // Show/hide loading state
+        function showLoading(show) {
+            document.getElementById('loadingState').classList.toggle('hidden', !show);
+        }
+
+        // Show notification
+        function showNotification(type, title, message) {
+            const notification = document.getElementById('notification');
+            const icon = document.getElementById('notificationIcon');
+            const titleEl = document.getElementById('notificationTitle');
+            const messageEl = document.getElementById('notificationMessage');
+            
+            // Set icon based on type
+            const icons = {
+                success: '✅',
+                error: '❌',
+                warning: '⚠️',
+                info: 'ℹ️'
+            };
+            
+            icon.textContent = icons[type] || icons.info;
+            titleEl.textContent = title;
+            messageEl.textContent = message;
+            
+            // Show notification
+            notification.classList.remove('hidden', 'translate-y-full');
+            
+            // Hide after 5 seconds
+            setTimeout(() => {
+                notification.classList.add('translate-y-full');
+                setTimeout(() => {
+                    notification.classList.add('hidden');
+                }, 300);
+            }, 5000);
+        }
+
+        // Demo functions for testing
+        window.demoActions = {
+            async addXP(amount) {
+                if (!currentProfile) return;
+                
+                currentProfile.learning.totalXP += amount;
+                const newLevel = calculateLevel(currentProfile.learning.totalXP);
+                currentProfile.learning.level = newLevel.level;
+                
+                localStorage.setItem('studentProfile', JSON.stringify(currentProfile));
+                showProfile(currentProfile);
+                
+                showNotification('success', 'XP Added', `+${amount} XP earned!`);
+            },
+            
+            async addCourse(courseData) {
+                if (!currentProfile) return;
+                
+                const course = {
+                    id: Date.now().toString(),
+                    title: courseData.title,
+                    category: courseData.category || 'General',
+                    difficulty: courseData.difficulty || 'beginner',
+                    completed: true,
+                    completedAt: new Date().toISOString(),
+                    xpEarned: courseData.xp || 50
+                };
+                
+                currentProfile.learning.courses.push(course);
+                currentProfile.learning.totalXP += course.xpEarned;
+                currentProfile.learning.level = calculateLevel(currentProfile.learning.totalXP).level;
+                
+                localStorage.setItem('studentProfile', JSON.stringify(currentProfile));
+                showProfile(currentProfile);
+                
+                showNotification('success', 'Course Completed', `${course.title} completed!`);
+            },
+            
+            async addAchievement(achievementData) {
+                if (!currentProfile) return;
+                
+                const achievement = {
+                    id: Date.now().toString(),
+                    title: achievementData.title,
+                    description: achievementData.description,
+                    icon: achievementData.icon || '🏆',
+                    xpReward: achievementData.xpReward || 25,
+                    unlockedAt: new Date().toISOString()
+                };
+                
+                currentProfile.achievements.push(achievement);
+                currentProfile.learning.totalXP += achievement.xpReward;
+                currentProfile.learning.level = calculateLevel(currentProfile.learning.totalXP).level;
+                
+                localStorage.setItem('studentProfile', JSON.stringify(currentProfile));
+                showProfile(currentProfile);
+                
+                showNotification('success', 'Achievement Unlocked!', achievement.title);
+            }
+        };
+
+        // Calculate level from XP
+        function calculateLevel(xp) {
+            const levels = [
+                { level: 1, requiredXP: 0, name: "Beginner" },
+                { level: 2, requiredXP: 100, name: "Novice" },
+                { level: 3, requiredXP: 250, name: "Apprentice" },
+                { level: 4, requiredXP: 500, name: "Scholar" },
+                { level: 5, requiredXP: 1000, name: "Expert" },
+                { level: 6, requiredXP: 2000, name: "Master" },
+                { level: 7, requiredXP: 5000, name: "Grandmaster" },
+                { level: 8, requiredXP: 10000, name: "Legend" }
+            ];
+            
+            for (let i = levels.length - 1; i >= 0; i--) {
+                if (xp >= levels[i].requiredXP) {
+                    return levels[i];
+                }
+            }
+            
+            return levels[0];
+        }
+    </script>
+</body>
+</html>

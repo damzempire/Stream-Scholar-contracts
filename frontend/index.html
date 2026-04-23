@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream-Scholar NFT Profile</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@stellar/stellar-sdk@12.0.0/dist/stellar-sdk.min.js"></script>
+    <style>
+        @keyframes levelUp {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
+        
+        .level-up-animation {
+            animation: levelUp 0.6s ease-in-out;
+        }
+        
+        .progress-bar {
+            transition: width 0.5s ease-in-out;
+        }
+        
+        .nft-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        
+        .nft-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
+        }
+        
+        .achievement-badge {
+            transition: transform 0.2s ease;
+        }
+        
+        .achievement-badge:hover {
+            transform: scale(1.1);
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+    <!-- Header -->
+    <header class="bg-gray-800 shadow-lg">
+        <div class="container mx-auto px-4 py-4">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-4">
+                    <div class="w-10 h-10 bg-gradient-to-r from-purple-500 to-pink-500 rounded-full"></div>
+                    <h1 class="text-2xl font-bold bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent">
+                        Stream-Scholar NFT
+                    </h1>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <button id="connectWallet" class="bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded-lg transition">
+                        Connect Wallet
+                    </button>
+                    <div id="walletAddress" class="hidden text-sm text-gray-400"></div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="container mx-auto px-4 py-8">
+        <!-- Mint NFT Section -->
+        <section id="mintSection" class="mb-12">
+            <div class="bg-gray-800 rounded-xl p-8 shadow-2xl">
+                <h2 class="text-3xl font-bold mb-6 text-center">Create Your Student Profile NFT</h2>
+                
+                <div class="grid md:grid-cols-2 gap-8">
+                    <div>
+                        <h3 class="text-xl font-semibold mb-4">Profile Information</h3>
+                        <form id="mintForm" class="space-y-4">
+                            <div>
+                                <label class="block text-sm font-medium mb-2">Student ID</label>
+                                <input type="text" id="studentId" required 
+                                    class="w-full bg-gray-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                                    placeholder="Enter your student ID">
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium mb-2">Display Name</label>
+                                <input type="text" id="displayName" required 
+                                    class="w-full bg-gray-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                                    placeholder="Your display name">
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium mb-2">Email</label>
+                                <input type="email" id="email" 
+                                    class="w-full bg-gray-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                                    placeholder="your@email.com">
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium mb-2">Bio</label>
+                                <textarea id="bio" rows="3" 
+                                    class="w-full bg-gray-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                                    placeholder="Tell us about your learning journey..."></textarea>
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium mb-2">Learning Style</label>
+                                <select id="learningStyle" 
+                                    class="w-full bg-gray-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500">
+                                    <option value="visual">Visual Learner</option>
+                                    <option value="auditory">Auditory Learner</option>
+                                    <option value="kinesthetic">Kinesthetic Learner</option>
+                                    <option value="reading">Reading/Writing</option>
+                                </select>
+                            </div>
+                            
+                            <button type="submit" 
+                                class="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 py-3 rounded-lg font-semibold transition">
+                                Mint Student Profile NFT
+                            </button>
+                        </form>
+                    </div>
+                    
+                    <div>
+                        <h3 class="text-xl font-semibold mb-4">NFT Preview</h3>
+                        <div id="nftPreview" class="nft-card rounded-xl p-6 text-white">
+                            <div class="text-center mb-4">
+                                <div id="previewAvatar" class="w-24 h-24 bg-gray-600 rounded-full mx-auto mb-4 flex items-center justify-center">
+                                    <span class="text-3xl">👤</span>
+                                </div>
+                                <h4 id="previewName" class="text-xl font-bold">Your Name</h4>
+                                <p id="previewId" class="text-sm opacity-75">Student ID</p>
+                            </div>
+                            
+                            <div class="mb-4">
+                                <div class="flex justify-between items-center mb-2">
+                                    <span class="text-sm">Level 1 - Beginner</span>
+                                    <span class="text-sm">0 XP</span>
+                                </div>
+                                <div class="w-full bg-gray-700 rounded-full h-2">
+                                    <div class="progress-bar bg-gradient-to-r from-purple-500 to-pink-500 h-2 rounded-full" style="width: 0%"></div>
+                                </div>
+                            </div>
+                            
+                            <div class="grid grid-cols-2 gap-4 text-sm">
+                                <div class="bg-gray-800 rounded-lg p-3 text-center">
+                                    <div class="text-2xl mb-1">📚</div>
+                                    <div class="font-semibold">0 Courses</div>
+                                </div>
+                                <div class="bg-gray-800 rounded-lg p-3 text-center">
+                                    <div class="text-2xl mb-1">🏆</div>
+                                    <div class="font-semibold">0 Achievements</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Profile Display Section -->
+        <section id="profileSection" class="hidden mb-12">
+            <div class="bg-gray-800 rounded-xl p-8 shadow-2xl">
+                <h2 class="text-3xl font-bold mb-6">Your Student Profile NFT</h2>
+                
+                <div class="grid md:grid-cols-3 gap-8">
+                    <!-- Main NFT Card -->
+                    <div class="md:col-span-1">
+                        <div id="nftCard" class="nft-card rounded-xl p-6 text-white">
+                            <!-- NFT content will be populated here -->
+                        </div>
+                        
+                        <div class="mt-4 space-y-2">
+                            <button id="updateXP" class="w-full bg-green-600 hover:bg-green-700 py-2 rounded-lg transition">
+                                Add XP
+                            </button>
+                            <button id="addAchievement" class="w-full bg-blue-600 hover:bg-blue-700 py-2 rounded-lg transition">
+                                Add Achievement
+                            </button>
+                            <button id="transferNFT" class="w-full bg-orange-600 hover:bg-orange-700 py-2 rounded-lg transition">
+                                Transfer NFT
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- Profile Details -->
+                    <div class="md:col-span-2 space-y-6">
+                        <!-- Level Progress -->
+                        <div class="bg-gray-700 rounded-xl p-6">
+                            <h3 class="text-xl font-semibold mb-4">Level Progress</h3>
+                            <div id="levelProgress">
+                                <!-- Level progress will be populated here -->
+                            </div>
+                        </div>
+                        
+                        <!-- Achievements -->
+                        <div class="bg-gray-700 rounded-xl p-6">
+                            <h3 class="text-xl font-semibold mb-4">Recent Achievements</h3>
+                            <div id="achievementsList" class="grid grid-cols-2 md:grid-cols-3 gap-4">
+                                <!-- Achievements will be populated here -->
+                            </div>
+                        </div>
+                        
+                        <!-- Courses -->
+                        <div class="bg-gray-700 rounded-xl p-6">
+                            <h3 class="text-xl font-semibold mb-4">Enrolled Courses</h3>
+                            <div id="coursesList" class="space-y-3">
+                                <!-- Courses will be populated here -->
+                            </div>
+                        </div>
+                        
+                        <!-- Activity Log -->
+                        <div class="bg-gray-700 rounded-xl p-6">
+                            <h3 class="text-xl font-semibold mb-4">Recent Activity</h3>
+                            <div id="activityLog" class="space-y-2">
+                                <!-- Activity will be populated here -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Market Section -->
+        <section id="marketSection" class="hidden mb-12">
+            <div class="bg-gray-800 rounded-xl p-8 shadow-2xl">
+                <h2 class="text-3xl font-bold mb-6">Stream-Scholar Marketplace</h2>
+                <div id="marketplaceGrid" class="grid md:grid-cols-3 gap-6">
+                    <!-- Marketplace items will be populated here -->
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Modal for XP/Actions -->
+    <div id="actionModal" class="hidden fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div class="bg-gray-800 rounded-xl p-8 max-w-md w-full mx-4">
+            <h3 id="modalTitle" class="text-xl font-semibold mb-4">Add XP</h3>
+            <form id="actionForm" class="space-y-4">
+                <div>
+                    <label id="modalLabel" class="block text-sm font-medium mb-2">XP Amount</label>
+                    <input type="number" id="modalInput" required 
+                        class="w-full bg-gray-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        placeholder="Enter amount">
+                </div>
+                <div class="flex space-x-4">
+                    <button type="submit" class="flex-1 bg-purple-600 hover:bg-purple-700 py-2 rounded-lg transition">
+                        Confirm
+                    </button>
+                    <button type="button" id="cancelModal" class="flex-1 bg-gray-600 hover:bg-gray-700 py-2 rounded-lg transition">
+                        Cancel
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Donation Modal -->
+    <div id="donationModal" class="hidden fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div class="bg-gray-800 rounded-xl p-8 max-w-md w-full mx-4">
+            <h3 class="text-xl font-semibold mb-4">💝 Tip Instructor</h3>
+            <div class="space-y-4">
+                <div>
+                    <p class="text-sm text-gray-300 mb-2">Send a voluntary tip to show appreciation for the instructor!</p>
+                    <p id="instructorName" class="text-sm font-medium text-purple-400 mb-4"></p>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium mb-2">Tip Amount (XLM)</label>
+                    <input type="number" id="donationAmount" required min="0.1" step="0.1"
+                        class="w-full bg-gray-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        placeholder="Enter amount">
+                </div>
+                <div class="flex space-x-4">
+                    <button type="button" onclick="streamScholarNFT.processDonation()" 
+                            class="flex-1 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 py-2 rounded-lg transition text-white font-medium">
+                        Send Tip
+                    </button>
+                    <button type="button" onclick="streamScholarNFT.closeDonationModal()" 
+                            class="flex-1 bg-gray-600 hover:bg-gray-700 py-2 rounded-lg transition">
+                        Cancel
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div id="toastContainer" class="fixed top-4 right-4 z-50 space-y-2"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>
