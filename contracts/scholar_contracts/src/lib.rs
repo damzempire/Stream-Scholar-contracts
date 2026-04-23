@@ -47,6 +47,11 @@ const MAX_SUBSIDIZED_STUDENTS: u32 = 100;
 const SUBSIDY_THRESHOLD: i128 = 5_0000000; // 5 XLM threshold
 const SUBSIDY_AMOUNT: i128 = 5_0000000;    // 5 XLM subsidy
 
+// Dynamic Sponsor-Clawback Logic constants
+const DEFAULT_CLAWBACK_COOLDOWN: u64 = 2592000; // 30 days
+const CLAWBACK_EXECUTION_TIMEOUT: u64 = 604800; // 7 days
+const MAX_CLAWBACK_PERCENTAGE: u64 = 100; // Max 100% can be clawed back
+
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -224,6 +229,55 @@ pub struct GPAUpdate {
     pub oracle_verified: bool,
 }
 
+// Dynamic Sponsor-Clawback Logic structs
+#[contracttype]
+#[derive(Clone)]
+pub enum ClawbackTriggerType {
+    GpaThreshold,
+    CourseCompletion,
+    TimeElapsed,
+    ActivityInactive,
+    CombinedConditions,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ClawbackCondition {
+    pub funder: Address,
+    pub student: Address,
+    pub trigger_type: ClawbackTriggerType,
+    pub clawback_percentage: u64, // 0-100
+    pub threshold_value: u64, // GPA (stored as 30 for 3.0), courses completed, days, etc.
+    pub triggered_at: Option<u64>,
+    pub executed_at: Option<u64>,
+    pub is_active: bool,
+    pub cooldown_period: u64, // Seconds before next clawback can be triggered
+    pub last_clawback_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ClawbackEvent {
+    pub funder: Address,
+    pub student: Address,
+    pub amount_clawed_back: i128,
+    pub trigger_type: ClawbackTriggerType,
+    pub triggered_at: u64,
+    pub executed_at: u64,
+    pub remaining_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SponsorClawbackPolicy {
+    pub sponsor: Address,
+    pub version: u64,
+    pub conditions: Vec<ClawbackCondition>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub is_active: bool,
+}
+
 
 #[contracttype]
 pub enum DataKey {
@@ -251,6 +305,10 @@ pub enum DataKey {
     Nonce(Address),
     GpaMultiplier(Address),
     GpaEpoch(Address),
+    ClawbackCondition(Address, Address, u64), // (funder, student, condition_id)
+    SponsorClawbackPolicy(Address), // sponsor address
+    ClawbackHistory(Address, Address), // (funder, student)
+    ClawbackEventLog(Address, Address, u64), // (funder, student, event_id)
 }
 
 #[contracttype]
