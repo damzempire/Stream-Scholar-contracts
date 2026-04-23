@@ -1180,3 +1180,564 @@ fn test_creator_royalty_split_unauthorized() {
     let shares = vec![&env, (teacher.clone(), 70u32), (editor.clone(), 30u32)];
     client.set_royalty_split(&unauthorized, &1, &shares);
 }
+
+// PoA (Proof-of-Attendance) Tests
+
+#[test]
+fn test_poa_configuration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Configure PoA with 1-week intervals and 7-day grace period
+    client.init_poa_config(&admin, &604800, &604800, &3);
+
+    let config = client.get_poa_config();
+    assert_eq!(config.checkpoint_interval_seconds, 604800);
+    assert_eq!(config.grace_period_seconds, 604800);
+    assert_eq!(config.max_proofs_per_checkpoint, 3);
+    assert!(config.is_active);
+}
+
+#[test]
+fn test_poa_successful_attendance_proof() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &5000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.init_poa_config(&admin, &604800, &604800, &3);
+
+    // Student buys access
+    client.buy_access(&student, &1, &100, &token_address.address());
+
+    // Set timestamp to start of first epoch
+    env.ledger().set_timestamp(100000);
+
+    // Submit attendance proof with valid hashes and timestamps
+    let proof_hashes = vec![
+        &env,
+        soroban_sdk::Bytes::from_slice(&env, b"hash1"),
+        soroban_sdk::Bytes::from_slice(&env, b"hash2"),
+    ];
+    let timestamps = vec![&env, 100001u64, 100002u64];
+
+    client.submit_attendance_proof(&student, &1, &proof_hashes, &timestamps);
+
+    // Verify student is still compliant
+    assert!(client.check_poa_compliance(&student, &1));
+    
+    let poa_state = client.get_student_poa_state(&student, &1);
+    assert_eq!(poa_state.current_state, CheckpointState::Compliant);
+    assert_eq!(poa_state.last_checkpoint_submitted, 0); // First epoch
+}
+
+#[test]
+#[should_panic]
+fn test_poa_invalid_timestamp_range() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &5000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.init_poa_config(&admin, &604800, &604800, &3);
+
+    client.buy_access(&student, &1, &100, &token_address.address());
+
+    // Set timestamp to middle of epoch
+    env.ledger().set_timestamp(400000);
+
+    // Submit with timestamp outside current epoch (too early)
+    let proof_hashes = vec![&env, soroban_sdk::Bytes::from_slice(&env, b"hash1")];
+    let timestamps = vec![&env, 100000u64]; // Outside current epoch
+
+    client.submit_attendance_proof(&student, &1, &proof_hashes, &timestamps);
+}
+
+#[test]
+fn test_poa_late_submission_within_grace_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &5000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.init_poa_config(&admin, &604800, &604800, &3);
+
+    client.buy_access(&student, &1, &100, &token_address.address());
+
+    // Start in first epoch
+    env.ledger().set_timestamp(100000);
+
+    // Skip to next epoch but within grace period
+    env.ledger().set_timestamp(700000); // Still within grace period of first epoch
+
+    // Submit proof for previous epoch
+    let proof_hashes = vec![&env, soroban_sdk::Bytes::from_slice(&env, b"hash1")];
+    let timestamps = vec![&env, 200000u64]; // Within first epoch
+
+    client.submit_attendance_proof(&student, &1, &proof_hashes, &timestamps);
+
+    // Should still be compliant (within grace period)
+    assert!(client.check_poa_compliance(&student, &1));
+}
+
+#[test]
+fn test_poa_late_submission_after_grace_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &5000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.init_poa_config(&admin, &604800, &604800, &3);
+
+    client.buy_access(&student, &1, &100, &token_address.address());
+
+    // Start in first epoch
+    env.ledger().set_timestamp(100000);
+
+    // Skip well beyond grace period
+    env.ledger().set_timestamp(1500000); // Well beyond grace period
+
+    // Submit proof for previous epoch
+    let proof_hashes = vec![&env, soroban_sdk::Bytes::from_slice(&env, b"hash1")];
+    let timestamps = vec![&env, 200000u64]; // Within first epoch
+
+    client.submit_attendance_proof(&student, &1, &proof_hashes, &timestamps);
+
+    // Should be delinquent and stream halted
+    assert!(!client.check_poa_compliance(&student, &1));
+    
+    let poa_state = client.get_student_poa_state(&student, &1);
+    assert_eq!(poa_state.current_state, CheckpointState::Delinquent);
+    assert!(poa_state.stream_halted_until > 0);
+}
+
+#[test]
+fn test_poa_access_denied_without_compliance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &5000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.init_poa_config(&admin, &604800, &604800, &3);
+
+    client.buy_access(&student, &1, &100, &token_address.address());
+
+    // Initially has access
+    assert!(client.has_access(&student, &1));
+
+    // Skip beyond grace period without submitting proof
+    env.ledger().set_timestamp(1500000);
+
+    // Should no longer have access due to PoA non-compliance
+    assert!(!client.has_access(&student, &1));
+}
+
+#[test]
+#[should_panic]
+fn test_poa_heartbeat_blocked_without_compliance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &5000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.init_poa_config(&admin, &604800, &604800, &3);
+
+    client.buy_access(&student, &1, &100, &token_address.address());
+
+    // Skip beyond grace period without submitting proof
+    env.ledger().set_timestamp(1500000);
+
+    // Heartbeat should fail due to PoA non-compliance
+    client.heartbeat(
+        &student,
+        &1,
+        &soroban_sdk::Bytes::from_slice(&env, b"test_signature"),
+    );
+}
+
+#[test]
+fn test_poa_resumed_after_successful_proof() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &5000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.init_poa_config(&admin, &604800, &604800, &3);
+
+    client.buy_access(&student, &1, &100, &token_address.address());
+
+    // Skip beyond grace period without submitting proof
+    env.ledger().set_timestamp(1500000);
+
+    // Should not have access
+    assert!(!client.has_access(&student, &1));
+
+    // Submit proof for current epoch
+    let proof_hashes = vec![&env, soroban_sdk::Bytes::from_slice(&env, b"hash1")];
+    let timestamps = vec![&env, 1400000u64]; // Within current epoch
+
+    client.submit_attendance_proof(&student, &1, &proof_hashes, &timestamps);
+
+    // Should have access again
+    assert!(client.has_access(&student, &1));
+    assert!(client.check_poa_compliance(&student, &1));
+}
+
+#[test]
+fn test_poa_subscription_with_compliance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let subscriber = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&subscriber, &500);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.init_poa_config(&admin, &604800, &604800, &3);
+
+    // Buy subscription
+    let course_ids = vec![&env, 1, 2, 3];
+    client.buy_subscription(&subscriber, &course_ids, &1, &300, &token_address.address());
+
+    // Initially has access via subscription
+    assert!(client.has_access(&subscriber, &1));
+
+    // Submit PoA proof
+    env.ledger().set_timestamp(100000);
+    let proof_hashes = vec![&env, soroban_sdk::Bytes::from_slice(&env, b"hash1")];
+    let timestamps = vec![&env, 100001u64];
+    client.submit_attendance_proof(&subscriber, &1, &proof_hashes, &timestamps);
+
+    // Should still have access
+    assert!(client.has_access(&subscriber, &1));
+
+    // Skip beyond grace period without new proof
+    env.ledger().set_timestamp(1500000);
+
+    // Should lose access even with subscription due to PoA non-compliance
+    assert!(!client.has_access(&subscriber, &1));
+}
+
+// Fuzz Tests for PoA Timeline Manipulation
+
+#[test]
+fn test_poa_fuzz_epoch_timeline_manipulation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &50000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    // Test with various epoch configurations
+    let test_configs = vec![
+        (3600, 1800, 1),    // 1 hour epoch, 30 min grace, 1 proof
+        (86400, 43200, 2),  // 1 day epoch, 12 hour grace, 2 proofs
+        (604800, 604800, 3), // 1 week epoch, 1 week grace, 3 proofs
+        (1209600, 86400, 5), // 2 week epoch, 1 day grace, 5 proofs
+    ];
+
+    for (epoch_seconds, grace_seconds, max_proofs) in test_configs {
+        // Reconfigure PoA
+        client.init_poa_config(&admin, &epoch_seconds, &grace_seconds, &max_proofs);
+
+        // Test timeline manipulation scenarios
+        test_timeline_manipulation_scenarios(
+            &env, &client, &student, &token_address.address(), epoch_seconds, grace_seconds
+        );
+    }
+}
+
+fn test_timeline_manipulation_scenarios(
+    env: &Env,
+    client: &ScholarContractClient,
+    student: &Address,
+    token_address: &Address,
+    epoch_seconds: u64,
+    grace_seconds: u64,
+) {
+    // Reset student state
+    client.buy_access(student, &1, &1000, token_address);
+
+    // Scenario 1: Submit proof exactly at epoch boundary
+    env.ledger().set_timestamp(epoch_seconds - 1);
+    let proof_hashes = vec![env, soroban_sdk::Bytes::from_slice(env, b"boundary_hash")];
+    let timestamps = vec![env, epoch_seconds - 1];
+    client.submit_attendance_proof(student, &1, &proof_hashes, &timestamps);
+    assert!(client.check_poa_compliance(student, &1));
+
+    // Scenario 2: Submit proof just within grace period
+    env.ledger().set_timestamp(epoch_seconds + grace_seconds - 1);
+    let proof_hashes2 = vec![env, soroban_sdk::Bytes::from_slice(env, b"grace_hash")];
+    let timestamps2 = vec![env, epoch_seconds + 100]; // Within first epoch
+    client.submit_attendance_proof(student, &1, &proof_hashes2, &timestamps2);
+    assert!(client.check_poa_compliance(student, &1));
+
+    // Scenario 3: Submit proof just after grace period (should fail)
+    env.ledger().set_timestamp(epoch_seconds + grace_seconds + 1);
+    let proof_hashes3 = vec![env, soroban_sdk::Bytes::from_slice(env, b"late_hash")];
+    let timestamps3 = vec![env, epoch_seconds + 200]; // Within first epoch
+    
+    // This should mark as delinquent
+    client.submit_attendance_proof(student, &1, &proof_hashes3, &timestamps3);
+    assert!(!client.check_poa_compliance(student, &1));
+
+    // Verify state is correctly set to delinquent
+    let poa_state = client.get_student_poa_state(student, &1);
+    assert_eq!(poa_state.current_state, CheckpointState::Delinquent);
+
+    // Scenario 4: Attempt to manipulate by jumping to future epoch
+    let future_epoch = 5;
+    env.ledger().set_timestamp(future_epoch * epoch_seconds);
+    
+    // Submit proof for current epoch should restore compliance
+    let proof_hashes4 = vec![env, soroban_sdk::Bytes::from_slice(env, b"future_hash")];
+    let timestamps4 = vec![env, future_epoch * epoch_seconds + 1000];
+    client.submit_attendance_proof(student, &1, &proof_hashes4, &timestamps4);
+    assert!(client.check_poa_compliance(student, &1));
+}
+
+#[test]
+fn test_poa_fuzz_grace_period_edge_cases() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &50000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    // Test with very short grace periods
+    let epoch_seconds = 3600; // 1 hour
+    let grace_seconds = 1;     // 1 second grace period
+    
+    client.init_poa_config(&admin, &epoch_seconds, &grace_seconds, &3);
+    client.buy_access(student, &1, &1000, token_address);
+
+    // Submit proof at start of epoch
+    env.ledger().set_timestamp(1000);
+    let proof_hashes = vec![env, soroban_sdk::Bytes::from_slice(env, b"early_hash")];
+    let timestamps = vec![env, 1001];
+    client.submit_attendance_proof(student, &1, &proof_hashes, &timestamps);
+
+    // Jump to exactly end of grace period
+    env.ledger().set_timestamp(epoch_seconds + grace_seconds);
+    
+    // Should still be compliant (exactly at grace period boundary)
+    assert!(client.check_poa_compliance(student, &1));
+
+    // Jump 1 second beyond grace period
+    env.ledger().set_timestamp(epoch_seconds + grace_seconds + 1);
+    
+    // Should no longer be compliant
+    assert!(!client.check_poa_compliance(student, &1));
+}
+
+#[test]
+fn test_poa_fuzz_multiple_epoch_jumps() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &50000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    let epoch_seconds = 3600; // 1 hour
+    let grace_seconds = 1800; // 30 minutes
+    
+    client.init_poa_config(&admin, &epoch_seconds, &grace_seconds, &3);
+    client.buy_access(student, &1, &1000, token_address);
+
+    // Test jumping multiple epochs without submissions
+    let mut current_time = 1000;
+    
+    for epoch in 1..=5 {
+        // Jump to start of epoch
+        current_time = epoch * epoch_seconds;
+        env.ledger().set_timestamp(current_time);
+        
+        // Should lose compliance after missing previous epoch
+        if epoch > 1 {
+            assert!(!client.check_poa_compliance(student, &1));
+        }
+        
+        // Submit proof for current epoch to restore compliance
+        let proof_hashes = vec![env, soroban_sdk::Bytes::from_slice(env, &format!("hash_{}", epoch).into_bytes())];
+        let timestamps = vec![env, current_time + 100];
+        client.submit_attendance_proof(student, &1, &proof_hashes, &timestamps);
+        
+        // Should be compliant again
+        assert!(client.check_poa_compliance(student, &1));
+        
+        // Verify correct epoch tracking
+        let poa_state = client.get_student_poa_state(student, &1);
+        assert_eq!(poa_state.last_checkpoint_submitted, epoch - 1);
+    }
+}
+
+#[test]
+fn test_poa_fuzz_concurrent_submissions() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &50000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    client.init_poa_config(&admin, &604800, &604800, &3);
+    client.buy_access(student, &1, &1000, token_address);
+
+    env.ledger().set_timestamp(100000);
+
+    // Test submitting maximum allowed proofs
+    let mut proof_hashes = Vec::new(&env);
+    let mut timestamps = Vec::new(&env);
+    
+    for i in 1..=3 {
+        proof_hashes.push_back(soroban_sdk::Bytes::from_slice(env, &format!("hash_{}", i).into_bytes()));
+        timestamps.push_back(100000 + i * 100);
+    }
+    
+    client.submit_attendance_proof(student, &1, &proof_hashes, &timestamps);
+    assert!(client.check_poa_compliance(student, &1));
+
+    // Try to submit one more proof (should fail)
+    let extra_hashes = vec![env, soroban_sdk::Bytes::from_slice(env, b"extra_hash")];
+    let extra_timestamps = vec![env, 100400];
+    
+    // This should panic due to exceeding max_proofs_per_checkpoint
+    std::panic::catch_unwind(|| {
+        client.submit_attendance_proof(student, &1, &extra_hashes, &extra_timestamps);
+    }).expect_err("Should panic when exceeding max proofs per checkpoint");
+}

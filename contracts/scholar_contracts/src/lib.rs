@@ -10,6 +10,8 @@ const MAX_COURSE_REGISTRY_SIZE: u64 = 1000; // Maximum number of courses to prev
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     SbtMint(Address, u64),
+    CheckpointPassed(Address, u64, u64), // student, course_id, checkpoint_timestamp
+    StreamHalted(Address, u64, u64),     // student, course_id, reason_timestamp
 }
 
 #[contracttype]
@@ -56,6 +58,18 @@ pub enum DataKey {
     HasBeenReferred(Address),
     ReferralBonusAmount,
     RoyaltySplit(u64), // course_id -> RoyaltySplit
+    // PoA (Proof-of-Attendance) related keys
+    PoAConfig,
+    AttendanceCheckpoint(u64), // checkpoint_number -> AttendanceCheckpoint
+    StudentPoAState(Address, u64), // student, course_id -> StudentPoAState
+    AttendanceProof(Address, u64, u64), // student, course_id, checkpoint_number -> AttendanceProof
+    ConsecutiveDays(Address, u64), // student, course_id -> StreakData
+    StreakBonusAmount,
+    GroupPool(u64), // pool_id -> GroupPool
+    GroupPoolMember(u64, Address), // pool_id, member -> contribution amount
+    GroupPoolAccess(u64, Address), // pool_id, member -> access granted
+    ModuleLockConfig(u64, u64), // course_id, module_id -> requires_quiz
+    ModuleQuizLock(Address, u64, u64), // student, course_id, module_id -> QuizProof
 }
 
 #[contracttype]
@@ -88,6 +102,87 @@ pub struct RoyaltySplit {
     pub shares: Vec<(Address, u32)>,
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub struct AttendanceProof {
+    pub student: Address,
+    pub course_id: u64,
+    pub proof_hash: soroban_sdk::Bytes,
+    pub timestamp: u64,
+    pub epoch_number: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckpointState {
+    Compliant,
+    Pending,
+    Delinquent,
+    Halted,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PoAConfig {
+    pub checkpoint_interval_seconds: u64,
+    pub grace_period_seconds: u64,
+    pub max_proofs_per_checkpoint: u32,
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AttendanceCheckpoint {
+    pub checkpoint_number: u64,
+    pub epoch_start: u64,
+    pub epoch_end: u64,
+    pub required_proofs: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StudentPoAState {
+    pub current_state: CheckpointState,
+    pub last_checkpoint_submitted: u64,
+    pub missed_checkpoints: u32,
+    pub grace_period_end: u64,
+    pub stream_halted_until: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StreakData {
+    pub current_streak: u64,
+    pub last_watch_date: u64,
+    pub total_reward_claimed: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupPool {
+    pub pool_id: u64,
+    pub course_id: u64,
+    pub target_amount: i128,
+    pub current_balance: i128,
+    pub creator: Address,
+    pub token: Address,
+    pub is_active: bool,
+    pub member_count: u64,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct QuizProof {
+    pub student: Address,
+    pub course_id: u64,
+    pub module_id: u64,
+    pub quiz_hash: Symbol,
+    pub score: u64,
+    pub passed_at: u64,
+    pub is_verified: bool,
+}
+
 #[contract]
 pub struct ScholarContract;
 
@@ -114,6 +209,312 @@ impl ScholarContract {
         env.storage()
             .instance()
             .set(&DataKey::HeartbeatInterval, &heartbeat_interval);
+    }
+
+    // PoA (Proof-of-Attendance) Configuration and Management
+    
+    pub fn init_poa_config(
+        env: Env,
+        admin: Address,
+        checkpoint_interval_seconds: u64,
+        grace_period_seconds: u64,
+        max_proofs_per_checkpoint: u32,
+    ) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        let poa_config = PoAConfig {
+            checkpoint_interval_seconds,
+            grace_period_seconds,
+            max_proofs_per_checkpoint,
+            is_active: true,
+        };
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::PoAConfig, &poa_config);
+    }
+
+    pub fn get_poa_config(env: Env) -> PoAConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::PoAConfig)
+            .unwrap_or(PoaConfig {
+                checkpoint_interval_seconds: 604800, // 1 week default
+                grace_period_seconds: 604800,        // 1 week grace period
+                max_proofs_per_checkpoint: 3,
+                is_active: false,
+            })
+    }
+
+    pub fn submit_attendance_proof(
+        env: Env,
+        student: Address,
+        course_id: u64,
+        proof_hashes: Vec<soroban_sdk::Bytes>,
+        timestamps: Vec<u64>,
+    ) {
+        student.require_auth();
+
+        // Verify PoA is active
+        let poa_config = Self::get_poa_config(env.clone());
+        if !poa_config.is_active {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Verify student has active access to the course
+        if !Self::has_access(env.clone(), student.clone(), course_id) {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Validate input arrays
+        if proof_hashes.len() != timestamps.len() || proof_hashes.len() == 0 {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        if proof_hashes.len() > poa_config.max_proofs_per_checkpoint as usize {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        let current_time = env.ledger().timestamp();
+        
+        // Calculate current epoch/checkpoint
+        let checkpoint_number = Self::calculate_current_checkpoint(env.clone(), current_time, &poa_config);
+        
+        // Verify all timestamps are within the current epoch
+        let checkpoint = Self::get_or_create_checkpoint(env.clone(), checkpoint_number, &poa_config);
+        
+        for i in 0..timestamps.len() {
+            let timestamp = timestamps.get(i).unwrap();
+            if *timestamp < checkpoint.epoch_start || *timestamp > checkpoint.epoch_end {
+                env.panic_with_error((
+                    soroban_sdk::xdr::ScErrorType::Contract,
+                    soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                ));
+            }
+        }
+
+        // Store attendance proofs
+        for i in 0..proof_hashes.len() {
+            let proof_hash = proof_hashes.get(i).unwrap();
+            let timestamp = timestamps.get(i).unwrap();
+            
+            let attendance_proof = AttendanceProof {
+                student: student.clone(),
+                course_id,
+                proof_hash: proof_hash.clone(),
+                timestamp: *timestamp,
+                epoch_number: checkpoint_number,
+            };
+            
+            env.storage()
+                .persistent()
+                .set(&DataKey::AttendanceProof(student.clone(), course_id, checkpoint_number), &attendance_proof);
+            env.storage().persistent().extend_ttl(
+                &DataKey::AttendanceProof(student.clone(), course_id, checkpoint_number),
+                LEDGER_BUMP_THRESHOLD,
+                LEDGER_BUMP_EXTEND,
+            );
+        }
+
+        // Update student PoA state
+        Self::update_student_poa_state(env.clone(), student.clone(), course_id, checkpoint_number);
+        
+        // Emit CheckpointPassed event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "CheckpointPassed"), student.clone(), course_id),
+            checkpoint_number,
+        );
+    }
+
+    fn calculate_current_checkpoint(env: Env, current_time: u64, poa_config: &PoAConfig) -> u64 {
+        // Simple epoch calculation starting from timestamp 0
+        current_time / poa_config.checkpoint_interval_seconds
+    }
+
+    fn get_or_create_checkpoint(env: Env, checkpoint_number: u64, poa_config: &PoAConfig) -> AttendanceCheckpoint {
+        let checkpoint_key = DataKey::AttendanceCheckpoint(checkpoint_number);
+        
+        if let Some(checkpoint) = env.storage().persistent().get(&checkpoint_key) {
+            checkpoint
+        } else {
+            // Create new checkpoint
+            let epoch_start = checkpoint_number * poa_config.checkpoint_interval_seconds;
+            let epoch_end = epoch_start + poa_config.checkpoint_interval_seconds;
+            
+            let checkpoint = AttendanceCheckpoint {
+                checkpoint_number,
+                epoch_start,
+                epoch_end,
+                required_proofs: poa_config.max_proofs_per_checkpoint,
+            };
+            
+            env.storage()
+                .persistent()
+                .set(&checkpoint_key, &checkpoint);
+            env.storage().persistent().extend_ttl(
+                &checkpoint_key,
+                LEDGER_BUMP_THRESHOLD,
+                LEDGER_BUMP_EXTEND,
+            );
+            
+            checkpoint
+        }
+    }
+
+    fn update_student_poa_state(env: Env, student: Address, course_id: u64, checkpoint_number: u64) {
+        let state_key = DataKey::StudentPoAState(student.clone(), course_id);
+        let current_time = env.ledger().timestamp();
+        let poa_config = Self::get_poa_config(env.clone());
+        
+        let mut poa_state: StudentPoAState = env
+            .storage()
+            .persistent()
+            .get(&state_key)
+            .unwrap_or(StudentPoAState {
+                current_state: CheckpointState::Compliant,
+                last_checkpoint_submitted: 0,
+                missed_checkpoints: 0,
+                grace_period_end: 0,
+                stream_halted_until: 0,
+            });
+
+        // Check if this is a late submission (after grace period)
+        let expected_checkpoint = Self::calculate_current_checkpoint(env.clone(), current_time, &poa_config);
+        
+        if checkpoint_number < expected_checkpoint {
+            // This is a late submission for a previous checkpoint
+            let grace_period_end = checkpoint_number * poa_config.checkpoint_interval_seconds + poa_config.grace_period_seconds;
+            
+            if current_time > grace_period_end {
+                // Too late - mark as delinquent and halt stream
+                poa_state.current_state = CheckpointState::Delinquent;
+                poa_state.stream_halted_until = current_time + poa_config.checkpoint_interval_seconds;
+                
+                // Emit StreamHalted event
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "StreamHalted"), student.clone(), course_id),
+                    current_time,
+                );
+            } else {
+                // Within grace period - update to compliant
+                poa_state.current_state = CheckpointState::Compliant;
+                poa_state.missed_checkpoints = 0;
+                poa_state.grace_period_end = 0;
+            }
+        } else {
+            // Current or future checkpoint - mark as compliant
+            poa_state.current_state = CheckpointState::Compliant;
+            poa_state.missed_checkpoints = 0;
+            poa_state.grace_period_end = 0;
+        }
+
+        poa_state.last_checkpoint_submitted = checkpoint_number;
+        
+        env.storage()
+            .persistent()
+            .set(&state_key, &poa_state);
+        env.storage().persistent().extend_ttl(
+            &state_key,
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    pub fn check_poa_compliance(env: Env, student: Address, course_id: u64) -> bool {
+        let poa_config = Self::get_poa_config(env.clone());
+        if !poa_config.is_active {
+            return true; // PoA not active, no compliance check needed
+        }
+
+        let state_key = DataKey::StudentPoAState(student.clone(), course_id);
+        let poa_state: Option<StudentPoAState> = env.storage().persistent().get(&state_key);
+        
+        if let Some(state) = poa_state {
+            let current_time = env.ledger().timestamp();
+            
+            // Check if stream is currently halted
+            if current_time < state.stream_halted_until {
+                return false;
+            }
+            
+            // Check if in grace period
+            if current_time < state.grace_period_end {
+                return false;
+            }
+            
+            // Check if delinquent
+            if state.current_state == CheckpointState::Delinquent {
+                return false;
+            }
+            
+            true
+        } else {
+            // No PoA state yet, assume compliant
+            true
+        }
+    }
+
+    pub fn get_student_poa_state(env: Env, student: Address, course_id: u64) -> StudentPoAState {
+        let state_key = DataKey::StudentPoAState(student.clone(), course_id);
+        if env.storage().persistent().has(&state_key) {
+            env.storage().persistent().extend_ttl(&state_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&state_key).unwrap_or(StudentPoAState {
+                current_state: CheckpointState::Compliant,
+                last_checkpoint_submitted: 0,
+                missed_checkpoints: 0,
+                grace_period_end: 0,
+                stream_halted_until: 0,
+            })
+        } else {
+            StudentPoAState {
+                current_state: CheckpointState::Compliant,
+                last_checkpoint_submitted: 0,
+                missed_checkpoints: 0,
+                grace_period_end: 0,
+                stream_halted_until: 0,
+            }
+        }
+    }
+
+    pub fn process_missed_checkpoints(env: Env) {
+        let poa_config = Self::get_poa_config(env.clone());
+        if !poa_config.is_active {
+            return;
+        }
+
+        let current_time = env.ledger().timestamp();
+        let current_checkpoint = Self::calculate_current_checkpoint(env.clone(), current_time, &poa_config);
+        
+        // This would typically be called by a cron job or admin
+        // For now, it's a manual function to check for missed checkpoints
+        // In production, you'd want to iterate through all active students
     }
 
     fn calculate_dynamic_rate(env: Env, student: Address, course_id: u64) -> i128 {
@@ -311,6 +712,14 @@ impl ScholarContract {
             ));
         }
 
+        // Verify PoA compliance
+        if !Self::check_poa_compliance(env.clone(), student.clone(), course_id) {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
         // SBT Minting Trigger logic
         let course_duration: u64 = env
             .storage()
@@ -411,7 +820,8 @@ impl ScholarContract {
 
         // Check subscription first
         if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
-            return true;
+            // Even with subscription, check PoA compliance
+            return Self::check_poa_compliance(env.clone(), student.clone(), course_id);
         }
 
         let access: Access = env
@@ -428,7 +838,10 @@ impl ScholarContract {
                 last_purchase_time: 0,
             });
 
-        env.ledger().timestamp() < access.expiry_time
+        let time_valid = env.ledger().timestamp() < access.expiry_time;
+        let poa_compliant = Self::check_poa_compliance(env.clone(), student.clone(), course_id);
+        
+        time_valid && poa_compliant
     }
 
     fn has_active_subscription(env: Env, student: Address, course_id: u64) -> bool {
