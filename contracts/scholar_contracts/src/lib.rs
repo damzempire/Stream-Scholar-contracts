@@ -47,6 +47,17 @@ const MAX_SUBSIDIZED_STUDENTS: u32 = 100;
 const SUBSIDY_THRESHOLD: i128 = 5_0000000; // 5 XLM threshold
 const SUBSIDY_AMOUNT: i128 = 5_0000000;    // 5 XLM subsidy
 
+// Dynamic Sponsor-Clawback Logic constants
+const DEFAULT_CLAWBACK_COOLDOWN: u64 = 2592000; // 30 days
+const CLAWBACK_EXECUTION_TIMEOUT: u64 = 604800; // 7 days
+const MAX_CLAWBACK_PERCENTAGE: u64 = 100; // Max 100% can be clawed back
+
+// Matching-Pool Quadratic Funding constants
+const QF_ROUND_DURATION: u64 = 2592000; // 30-day funding rounds
+const QF_MIN_CONTRIBUTION: i128 = 1_0000000; // 1 XLM minimum contribution
+const QF_MATCHING_POOL_RESERVE: i128 = 10000_0000000; // 10,000 XLM matching pool reserve
+const QF_MAX_PROJECTS: u64 = 500; // Max projects per round
+
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -224,6 +235,107 @@ pub struct GPAUpdate {
     pub oracle_verified: bool,
 }
 
+// Dynamic Sponsor-Clawback Logic structs
+#[contracttype]
+#[derive(Clone)]
+pub enum ClawbackTriggerType {
+    GpaThreshold,
+    CourseCompletion,
+    TimeElapsed,
+    ActivityInactive,
+    CombinedConditions,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ClawbackCondition {
+    pub funder: Address,
+    pub student: Address,
+    pub trigger_type: ClawbackTriggerType,
+    pub clawback_percentage: u64, // 0-100
+    pub threshold_value: u64, // GPA (stored as 30 for 3.0), courses completed, days, etc.
+    pub triggered_at: Option<u64>,
+    pub executed_at: Option<u64>,
+    pub is_active: bool,
+    pub cooldown_period: u64, // Seconds before next clawback can be triggered
+    pub last_clawback_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ClawbackEvent {
+    pub funder: Address,
+    pub student: Address,
+    pub amount_clawed_back: i128,
+    pub trigger_type: ClawbackTriggerType,
+    pub triggered_at: u64,
+    pub executed_at: u64,
+    pub remaining_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SponsorClawbackPolicy {
+    pub sponsor: Address,
+    pub version: u64,
+    pub conditions: Vec<ClawbackCondition>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub is_active: bool,
+}
+
+// Matching-Pool Quadratic Funding structs
+#[contracttype]
+#[derive(Clone)]
+pub struct QuadraticFundingRound {
+    pub round_id: u64,
+    pub token: Address,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub matching_pool_balance: i128,
+    pub total_contributions: i128,
+    pub total_matching_distributed: i128,
+    pub project_count: u64,
+    pub is_active: bool,
+    pub is_finalized: bool,
+    pub created_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct FundingProject {
+    pub project_id: u64,
+    pub round_id: u64,
+    pub project_owner: Address,
+    pub title: Symbol,
+    pub total_raised: i128,
+    pub contributor_count: u64,
+    pub sqrt_sum_contributions: i128, // For QF formula: sum of sqrt(contributions)
+    pub total_matching: i128,
+    pub created_at: u64,
+    pub is_approved: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct QFContribution {
+    pub contributor: Address,
+    pub project_id: u64,
+    pub round_id: u64,
+    pub amount: i128,
+    pub contribution_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MatchingDistribution {
+    pub round_id: u64,
+    pub project_id: u64,
+    pub matching_amount: i128,
+    pub distributed_at: u64,
+    pub project_owner: Address,
+}
+
 
 #[contracttype]
 pub enum DataKey {
@@ -251,6 +363,31 @@ pub enum DataKey {
     Nonce(Address),
     GpaMultiplier(Address),
     GpaEpoch(Address),
+    ClawbackCondition(Address, Address, u64), // (funder, student, condition_id)
+    SponsorClawbackPolicy(Address), // sponsor address
+    ClawbackHistory(Address, Address), // (funder, student)
+    ClawbackEventLog(Address, Address, u64), // (funder, student, event_id)
+    StudentProfile(Address),
+    StudentGPA(Address),
+    StudentUniversity(Address),
+    UniversityAdmin(Address),
+    SecurityHold(Address),
+    Milestone(Address, Symbol),
+    CommunityVote(Address),
+    TaxRate,
+    ResearchBonusFund,
+    LeaderboardSize,
+    HasReceivedSubsidy(Address),
+    SubsidizedStudentCount,
+    GraduationRegistry(Address),
+    QuadraticFundingRound(u64), // (round_id)
+    FundingProject(u64, u64), // (round_id, project_id)
+    QFContribution(Address, u64, u64), // (contributor, round_id, project_id)
+    MatchingDistribution(u64, u64), // (round_id, project_id)
+    RoundProjectList(u64), // (round_id)
+    ProjectContributorsList(u64, u64), // (round_id, project_id)
+    QFAdmin,
+    QFRoundCounter,
 }
 
 #[contracttype]
@@ -1366,6 +1503,741 @@ impl ScholarContract {
         let new_rate = Self::calculate_remaining_airtime(env.clone(), student.clone());
 
         env.events().publish((Symbol::new(&env, "MultiplierApplied"), student, old_rate as i128, new_rate as i128), payload.gpa_bps);
+    }
+
+    // --- Dynamic Sponsor-Clawback Logic Implementation ---
+
+    /// Register a new clawback condition for a scholarship
+    /// Only the sponsor (funder) can register conditions
+    pub fn register_clawback_condition(
+        env: Env,
+        funder: Address,
+        student: Address,
+        trigger_type: ClawbackTriggerType,
+        clawback_percentage: u64,
+        threshold_value: u64,
+    ) {
+        funder.require_auth();
+
+        // Validate clawback percentage
+        if clawback_percentage > MAX_CLAWBACK_PERCENTAGE {
+            panic!("Clawback percentage exceeds maximum");
+        }
+
+        // Verify scholarship exists
+        let scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found for this student");
+
+        if scholarship.funder != funder {
+            panic!("Only the scholarship funder can register clawback conditions");
+        }
+
+        // Generate condition ID based on timestamp
+        let condition_id = env.ledger().timestamp();
+
+        let condition = ClawbackCondition {
+            funder: funder.clone(),
+            student: student.clone(),
+            trigger_type,
+            clawback_percentage,
+            threshold_value,
+            triggered_at: None,
+            executed_at: None,
+            is_active: true,
+            cooldown_period: DEFAULT_CLAWBACK_COOLDOWN,
+            last_clawback_time: 0,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id), &condition);
+
+        env.events().publish(
+            (Symbol::new(&env, "clawback_registered"), funder, student),
+            (trigger_type, clawback_percentage),
+        );
+    }
+
+    /// Check if clawback conditions are met and trigger clawback if conditions are satisfied
+    pub fn check_and_trigger_clawback(
+        env: Env,
+        funder: Address,
+        student: Address,
+        condition_id: u64,
+    ) -> bool {
+        let condition: ClawbackCondition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id))
+            .expect("Clawback condition not found");
+
+        if !condition.is_active {
+            return false;
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Check cooldown period
+        if now < condition.last_clawback_time + condition.cooldown_period {
+            return false; // Still in cooldown
+        }
+
+        // Check if condition is met based on trigger type
+        let condition_met = match condition.trigger_type {
+            ClawbackTriggerType::GpaThreshold => {
+                Self::check_gpa_threshold(&env, &student, condition.threshold_value)
+            }
+            ClawbackTriggerType::CourseCompletion => {
+                Self::check_course_completion(&env, &student, condition.threshold_value)
+            }
+            ClawbackTriggerType::TimeElapsed => {
+                Self::check_time_elapsed(&env, &condition, condition.threshold_value)
+            }
+            ClawbackTriggerType::ActivityInactive => {
+                Self::check_activity_inactive(&env, &student, condition.threshold_value)
+            }
+            ClawbackTriggerType::CombinedConditions => {
+                Self::check_combined_conditions(&env, &student, &condition)
+            }
+        };
+
+        if condition_met {
+            let mut updated_condition = condition.clone();
+            updated_condition.triggered_at = Some(now);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id), &updated_condition);
+            return true;
+        }
+
+        false
+    }
+
+    /// Execute clawback of funds from a scholarship
+    pub fn execute_clawback(
+        env: Env,
+        funder: Address,
+        student: Address,
+        condition_id: u64,
+    ) -> i128 {
+        funder.require_auth();
+
+        let mut condition: ClawbackCondition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id))
+            .expect("Clawback condition not found");
+
+        if !condition.is_active {
+            panic!("Clawback condition is not active");
+        }
+
+        if condition.triggered_at.is_none() {
+            panic!("Clawback condition has not been triggered");
+        }
+
+        // Check execution timeout (7 days after trigger)
+        let now = env.ledger().timestamp();
+        let triggered_time = condition.triggered_at.unwrap();
+        if now > triggered_time + CLAWBACK_EXECUTION_TIMEOUT {
+            panic!("Clawback execution window has expired");
+        }
+
+        if condition.executed_at.is_some() {
+            panic!("Clawback has already been executed for this condition");
+        }
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if scholarship.funder != funder {
+            panic!("Only the scholarship funder can execute clawback");
+        }
+
+        // Calculate clawback amount
+        let clawback_amount =
+            (scholarship.balance * condition.clawback_percentage as i128) / 100;
+
+        if clawback_amount <= 0 {
+            panic!("Calculated clawback amount is zero or negative");
+        }
+
+        // Update scholarship
+        scholarship.balance -= clawback_amount;
+        if scholarship.unlocked_balance > clawback_amount {
+            scholarship.unlocked_balance -= clawback_amount;
+        } else {
+            scholarship.unlocked_balance = 0;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        // Update condition
+        condition.executed_at = Some(now);
+        condition.last_clawback_time = now;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id), &condition);
+
+        // Record clawback event
+        let event_id = now;
+        let clawback_event = ClawbackEvent {
+            funder: funder.clone(),
+            student: student.clone(),
+            amount_clawed_back: clawback_amount,
+            trigger_type: condition.trigger_type,
+            triggered_at: triggered_time,
+            executed_at: now,
+            remaining_balance: scholarship.balance,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClawbackEventLog(funder.clone(), student.clone(), event_id), &clawback_event);
+
+        // Transfer clawed back funds to funder
+        let client = token::Client::new(&env, &scholarship.token);
+        client.transfer(&env.current_contract_address(), &funder, &clawback_amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "clawback_executed"), funder, student),
+            (clawback_amount, scholarship.balance),
+        );
+
+        clawback_amount
+    }
+
+    /// Revoke an active clawback condition (only funder can revoke)
+    pub fn revoke_clawback_condition(
+        env: Env,
+        funder: Address,
+        student: Address,
+        condition_id: u64,
+    ) {
+        funder.require_auth();
+
+        let mut condition: ClawbackCondition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id))
+            .expect("Clawback condition not found");
+
+        if !condition.is_active {
+            panic!("Condition is already revoked");
+        }
+
+        if condition.executed_at.is_some() {
+            panic!("Cannot revoke a condition that has already been executed");
+        }
+
+        condition.is_active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClawbackCondition(funder.clone(), student.clone(), condition_id), &condition);
+
+        env.events().publish(
+            (Symbol::new(&env, "clawback_revoked"), funder, student),
+            condition_id,
+        );
+    }
+
+    /// Get clawback condition details
+    pub fn get_clawback_condition(
+        env: Env,
+        funder: Address,
+        student: Address,
+        condition_id: u64,
+    ) -> Option<ClawbackCondition> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClawbackCondition(funder, student, condition_id))
+    }
+
+    /// Get clawback event details
+    pub fn get_clawback_event(
+        env: Env,
+        funder: Address,
+        student: Address,
+        event_id: u64,
+    ) -> Option<ClawbackEvent> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClawbackEventLog(funder, student, event_id))
+    }
+
+    // Helper functions for condition checking
+    fn check_gpa_threshold(env: &Env, student: &Address, threshold: u64) -> bool {
+        if let Some(gpa_data) = env
+            .storage()
+            .persistent()
+            .get::<_, StudentGPA>(&DataKey::StudentGPA(student.clone()))
+        {
+            // If GPA falls below threshold, clawback is triggered
+            gpa_data.gpa < threshold
+        } else {
+            false
+        }
+    }
+
+    fn check_course_completion(env: &Env, student: &Address, threshold: u64) -> bool {
+        if let Some(profile) = env
+            .storage()
+            .persistent()
+            .get::<_, StudentProfile>(&DataKey::StudentProfile(student.clone()))
+        {
+            // If courses completed is below threshold, clawback is triggered
+            (profile.courses_completed as u64) < threshold
+        } else {
+            false
+        }
+    }
+
+    fn check_time_elapsed(env: &Env, condition: &ClawbackCondition, threshold_days: u64) -> bool {
+        let threshold_seconds = threshold_days * 86400;
+        if let Some(triggered) = condition.triggered_at {
+            let now = env.ledger().timestamp();
+            now >= triggered + threshold_seconds
+        } else {
+            false
+        }
+    }
+
+    fn check_activity_inactive(env: &Env, student: &Address, inactivity_threshold_days: u64) -> bool {
+        if let Some(profile) = env
+            .storage()
+            .persistent()
+            .get::<_, StudentProfile>(&DataKey::StudentProfile(student.clone()))
+        {
+            let inactivity_seconds = inactivity_threshold_days * 86400;
+            let now = env.ledger().timestamp();
+            let time_since_activity = now.saturating_sub(profile.last_activity);
+            time_since_activity > inactivity_seconds
+        } else {
+            false
+        }
+    }
+
+    fn check_combined_conditions(
+        env: &Env,
+        student: &Address,
+        condition: &ClawbackCondition,
+    ) -> bool {
+        // Combined: GPA below threshold AND inactive for 30 days
+        let gpa_check = Self::check_gpa_threshold(env, student, 25); // 2.5 GPA threshold
+        let inactivity_check = Self::check_activity_inactive(env, student, 30);
+        gpa_check && inactivity_check
+    }
+
+    // --- Matching-Pool Quadratic Funding Implementation ---
+
+    /// Initialize a new quadratic funding round
+    pub fn init_quadratic_funding_round(
+        env: Env,
+        admin: Address,
+        token: Address,
+        matching_pool_amount: i128,
+    ) -> u64 {
+        admin.require_auth();
+
+        if matching_pool_amount < QF_MATCHING_POOL_RESERVE {
+            panic!("Matching pool amount is below minimum reserve");
+        }
+
+        // Get next round ID
+        let round_counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::QFRoundCounter)
+            .unwrap_or(0);
+        let round_id = round_counter + 1;
+
+        let now = env.ledger().timestamp();
+        let end_time = now + QF_ROUND_DURATION;
+
+        let round = QuadraticFundingRound {
+            round_id,
+            token: token.clone(),
+            start_time: now,
+            end_time,
+            matching_pool_balance: matching_pool_amount,
+            total_contributions: 0,
+            total_matching_distributed: 0,
+            project_count: 0,
+            is_active: true,
+            is_finalized: false,
+            created_by: admin.clone(),
+        };
+
+        // Transfer matching pool tokens to contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&admin, &env.current_contract_address(), &matching_pool_amount);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::QFRoundCounter, &round_id);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::QuadraticFundingRound(round_id), &round);
+
+        env.events().publish(
+            (Symbol::new(&env, "qf_round_created"), round_id as u64),
+            (matching_pool_amount, end_time),
+        );
+
+        round_id
+    }
+
+    /// Register a project for a QF round
+    pub fn register_qf_project(
+        env: Env,
+        project_owner: Address,
+        round_id: u64,
+        title: Symbol,
+    ) -> u64 {
+        project_owner.require_auth();
+
+        let mut round: QuadraticFundingRound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+            .expect("QF round not found");
+
+        if !round.is_active {
+            panic!("QF round is not active");
+        }
+
+        if round.project_count >= QF_MAX_PROJECTS {
+            panic!("Maximum projects per round reached");
+        }
+
+        let now = env.ledger().timestamp();
+        if now > round.end_time {
+            panic!("QF round has ended");
+        }
+
+        let project_id = round.project_count + 1;
+
+        let project = FundingProject {
+            project_id,
+            round_id,
+            project_owner: project_owner.clone(),
+            title,
+            total_raised: 0,
+            contributor_count: 0,
+            sqrt_sum_contributions: 0,
+            total_matching: 0,
+            created_at: now,
+            is_approved: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FundingProject(round_id, project_id), &project);
+
+        round.project_count += 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::QuadraticFundingRound(round_id), &round);
+
+        env.events().publish(
+            (Symbol::new(&env, "qf_project_registered"), round_id, project_id as u64),
+            project_owner,
+        );
+
+        project_id
+    }
+
+    /// Contribute to a project in QF round
+    pub fn contribute_to_qf_project(
+        env: Env,
+        contributor: Address,
+        round_id: u64,
+        project_id: u64,
+        amount: i128,
+    ) {
+        contributor.require_auth();
+
+        if amount < QF_MIN_CONTRIBUTION {
+            panic!("Contribution amount is below minimum");
+        }
+
+        let mut round: QuadraticFundingRound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+            .expect("QF round not found");
+
+        if !round.is_active {
+            panic!("QF round is not active");
+        }
+
+        let now = env.ledger().timestamp();
+        if now > round.end_time {
+            panic!("QF round has ended");
+        }
+
+        let mut project: FundingProject = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FundingProject(round_id, project_id))
+            .expect("Project not found");
+
+        if !project.is_approved {
+            panic!("Project is not approved");
+        }
+
+        // Record contribution
+        let contribution = QFContribution {
+            contributor: contributor.clone(),
+            project_id,
+            round_id,
+            amount,
+            contribution_time: now,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::QFContribution(contributor.clone(), round_id, project_id), &contribution);
+
+        // Update project stats
+        project.total_raised += amount;
+        project.contributor_count += 1;
+
+        // Calculate sqrt of contribution for QF formula
+        let sqrt_amount = Self::isqrt(amount);
+        project.sqrt_sum_contributions += sqrt_amount;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FundingProject(round_id, project_id), &project);
+
+        // Update round stats
+        round.total_contributions += amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::QuadraticFundingRound(round_id), &round);
+
+        // Transfer contribution tokens to contract
+        let client = token::Client::new(&env, &round.token);
+        client.transfer(&contributor, &env.current_contract_address(), &amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "qf_contributed"), contributor, round_id, project_id as u64),
+            amount,
+        );
+    }
+
+    /// Finalize QF round and calculate matching amounts
+    pub fn finalize_qf_round(env: Env, admin: Address, round_id: u64) {
+        admin.require_auth();
+
+        let mut round: QuadraticFundingRound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+            .expect("QF round not found");
+
+        if round.is_finalized {
+            panic!("QF round is already finalized");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < round.end_time {
+            panic!("QF round has not ended yet");
+        }
+
+        // Calculate matching amounts for all projects using QF formula
+        // Matching = (Σ√contribution)² - Σcontribution
+        let total_sqrt_sum: i128 = Self::calculate_total_sqrt_sum(&env, round_id);
+        let total_matching_budget = (total_sqrt_sum * total_sqrt_sum) - round.total_contributions;
+
+        if total_matching_budget <= 0 || total_matching_budget > round.matching_pool_balance {
+            panic!("Matching budget calculation failed");
+        }
+
+        // Distribute matching to projects
+        let mut total_distributed: i128 = 0;
+        for project_idx in 1..=round.project_count {
+            if let Some(mut project) = env
+                .storage()
+                .persistent()
+                .get::<_, FundingProject>(&DataKey::FundingProject(round_id, project_idx))
+            {
+                if project.sqrt_sum_contributions > 0 {
+                    let project_matching = ((project.sqrt_sum_contributions * project.sqrt_sum_contributions)
+                        - project.total_raised)
+                        .max(0);
+
+                    if project_matching > 0 {
+                        project.total_matching = project_matching;
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::FundingProject(round_id, project_idx), &project);
+
+                        // Record matching distribution
+                        let distribution = MatchingDistribution {
+                            round_id,
+                            project_id: project_idx,
+                            matching_amount: project_matching,
+                            distributed_at: now,
+                            project_owner: project.project_owner.clone(),
+                        };
+
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::MatchingDistribution(round_id, project_idx), &distribution);
+
+                        total_distributed += project_matching;
+                    }
+                }
+            }
+        }
+
+        round.total_matching_distributed = total_distributed;
+        round.is_finalized = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::QuadraticFundingRound(round_id), &round);
+
+        env.events().publish(
+            (Symbol::new(&env, "qf_round_finalized"), round_id),
+            (total_distributed, round.total_contributions),
+        );
+    }
+
+    /// Claim matching funds for a project
+    pub fn claim_qf_matching(env: Env, project_owner: Address, round_id: u64, project_id: u64) {
+        project_owner.require_auth();
+
+        let round: QuadraticFundingRound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+            .expect("QF round not found");
+
+        if !round.is_finalized {
+            panic!("QF round has not been finalized yet");
+        }
+
+        let mut project: FundingProject = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FundingProject(round_id, project_id))
+            .expect("Project not found");
+
+        if project.project_owner != project_owner {
+            panic!("Only project owner can claim matching funds");
+        }
+
+        if project.total_matching <= 0 {
+            panic!("No matching funds to claim");
+        }
+
+        let matching_amount = project.total_matching;
+        project.total_matching = 0; // Prevent double-claiming
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FundingProject(round_id, project_id), &project);
+
+        // Transfer matching funds to project owner
+        let client = token::Client::new(&env, &round.token);
+        client.transfer(&env.current_contract_address(), &project_owner, &matching_amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "qf_matching_claimed"), round_id, project_id as u64),
+            matching_amount,
+        );
+    }
+
+    /// Get QF round details
+    pub fn get_qf_round(env: Env, round_id: u64) -> Option<QuadraticFundingRound> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+    }
+
+    /// Get project details
+    pub fn get_qf_project(env: Env, round_id: u64, project_id: u64) -> Option<FundingProject> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FundingProject(round_id, project_id))
+    }
+
+    /// Get contribution details
+    pub fn get_qf_contribution(
+        env: Env,
+        contributor: Address,
+        round_id: u64,
+        project_id: u64,
+    ) -> Option<QFContribution> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::QFContribution(contributor, round_id, project_id))
+    }
+
+    /// Get matching distribution for a project
+    pub fn get_qf_matching_distribution(
+        env: Env,
+        round_id: u64,
+        project_id: u64,
+    ) -> Option<MatchingDistribution> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MatchingDistribution(round_id, project_id))
+    }
+
+    // --- QF Helper Functions ---
+
+    /// Integer square root calculation
+    fn isqrt(n: i128) -> i128 {
+        if n < 0 {
+            return 0;
+        }
+        if n == 0 {
+            return 0;
+        }
+
+        let mut x = n;
+        let mut y = (x + 1) / 2;
+
+        while y < x {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+
+        x
+    }
+
+    /// Calculate total sqrt sum across all projects in a round
+    fn calculate_total_sqrt_sum(env: &Env, round_id: u64) -> i128 {
+        let round: QuadraticFundingRound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+            .expect("QF round not found");
+
+        let mut total_sqrt = 0i128;
+        for project_idx in 1..=round.project_count {
+            if let Some(project) = env
+                .storage()
+                .persistent()
+                .get::<_, FundingProject>(&DataKey::FundingProject(round_id, project_idx))
+            {
+                total_sqrt += project.sqrt_sum_contributions;
+            }
+        }
+
+        total_sqrt
     }
 }
 
