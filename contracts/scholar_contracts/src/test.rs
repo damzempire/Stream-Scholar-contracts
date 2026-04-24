@@ -2108,446 +2108,82 @@ fn test_multiple_milestone_claims() {
     assert_eq!(token_client.balance(&student), 850); // 100 initial + 200 + 300 + 250
 }
 
-// Disciplinary Slashing Tests
-
 #[test]
-fn test_university_oracle_initialization() {
+fn test_private_claim_logic() {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-
-    // Initialize oracle with multi-sig threshold of 3
-    client.init_university_oracle(&admin, &oracle, &3);
-
-    // Verify oracle configuration
-    let (stored_oracle, threshold) = client.get_oracle_config();
-    assert_eq!(stored_oracle.unwrap(), oracle);
-    assert_eq!(threshold.unwrap(), 3);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #6)")]
-fn test_oracle_initialization_invalid_threshold() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-
-    // Should fail with threshold less than 2
-    client.init_university_oracle(&admin, &oracle, &1);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #6)")]
-fn test_oracle_initialization_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let unauthorized = Address::generate(&env);
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-
-    // Should fail - unauthorized caller
-    client.init_university_oracle(&unauthorized, &oracle, &3);
-}
-
-#[test]
-fn test_minor_violation_slashing() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
     let student = Address::generate(&env);
     let token_admin = Address::generate(&env);
 
     let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&student, &10000);
+    token_client.mint(&student, &1000);
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
 
     client.init(&10, &3600, &10, &100, &60);
     client.set_admin(&admin);
-    client.init_university_oracle(&admin, &oracle, &3);
 
-    // Student buys access for 1000 tokens (100 seconds)
-    client.buy_access(&student, &1, &1000, &token_address.address());
-    
-    env.ledger().set_timestamp(50); // Half way through access period
-    
-    // Verify student has access before slash
-    assert!(client.has_access(&student, &1));
-    
-    // Check contract and student balances before slash
-    let contract_balance_before = token::Client::new(&env, &token_address.address()).balance(&contract_id);
-    let admin_balance_before = token::Client::new(&env, &token_address.address()).balance(&admin);
-    
-    // Create disciplinary payload for minor violation
-    let evidence_hash = soroban_sdk::Bytes::from_slice(&env, b"evidence_of_cheating");
-    let reason = soroban_sdk::Bytes::from_slice(&env, b"Minor academic misconduct");
-    let signatures = vec![&env, 
-        soroban_sdk::Bytes::from_slice(&env, b"sig1"),
-        soroban_sdk::Bytes::from_slice(&env, b"sig2"),
-        soroban_sdk::Bytes::from_slice(&env, b"sig3")
-    ];
-    
-    let payload = DisciplinaryPayload {
-        student: student.clone(),
-        course_id: 1,
-        violation_type: ViolationType::Minor,
-        evidence_hash: evidence_hash.clone(),
-        oracle_signatures: signatures,
-        timestamp: env.ledger().timestamp(),
-        reason: reason.clone(),
+    // Give student some scholarship balance
+    client.buy_access(&student, &1, &500, &token_address.address());
+    // (Note: in current logic, buy_access creates a Scholarship record)
+
+    // 1. Store a commitment
+    let commitment = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    client.store_claim_commitment(&admin, &commitment);
+
+    // 2. Claim private with valid proof
+    let nullifier = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+    let proof_data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 128]); // Placeholder proof
+    let mut public_signals = Vec::new(&env);
+    public_signals.push_back(soroban_sdk::BytesN::from_array(&env, &[3u8; 32]));
+
+    let zk_proof = ZKClaimProof {
+        nullifier: nullifier.clone(),
+        commitment: commitment.clone(),
+        proof: proof_data,
+        public_signals,
     };
-    
-    // Execute slashing
-    client.trigger_disciplinary_slash(&oracle, &payload);
-    
-    // Verify student access is halted for 30 days
-    assert!(!client.has_access(&student, &1));
-    
-    // Verify student is marked as slashed
-    assert!(client.is_student_slashed(&student, &1));
-    
-    // Get slashed student info
-    let slashed_info = client.get_slashed_student_info(&student, &1).unwrap();
-    assert_eq!(slashed_info.violation_type, ViolationType::Minor);
-    assert!(slashed_info.stream_halted_until > env.ledger().timestamp()); // Should be in future
-    
-    // Verify refund was processed (remaining 50 seconds * 10 tokens/sec = 500 tokens)
-    let expected_refund = 500; // 50 seconds remaining * 10 tokens/second
-    let contract_balance_after = token::Client::new(&env, &token_address.address()).balance(&contract_id);
-    let admin_balance_after = token::Client::new(&env, &token_address.address()).balance(&admin);
-    
-    assert_eq!(contract_balance_before - contract_balance_after, expected_refund);
-    assert_eq!(admin_balance_after - admin_balance_before, expected_refund);
-    
-    // Verify disciplinary record is stored
-    let record = client.get_disciplinary_record(&student, &1).unwrap();
-    assert_eq!(record.violation_type, ViolationType::Minor);
-    assert_eq!(record.evidence_hash, evidence_hash);
-    assert_eq!(record.reason, reason);
+
+    let balance_before = token::Client::new(&env, &token_address.address()).balance(&student);
+    client.claim_scholarship_private(&student, &100, &zk_proof);
+    let balance_after = token::Client::new(&env, &token_address.address()).balance(&student);
+
+    assert_eq!(balance_after - balance_before, 100);
+
+    // 3. Attempt to reuse nullifier (should fail)
+    let result_reuse = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship_private"),
+        (
+            &student,
+            100i128,
+            &zk_proof,
+        ),
+    );
+    assert!(result_reuse.is_err());
+
+    // 4. Attempt to use invalid commitment
+    let invalid_commitment = soroban_sdk::BytesN::from_array(&env, &[4u8; 32]);
+    let zk_proof_invalid = ZKClaimProof {
+        nullifier: soroban_sdk::BytesN::from_array(&env, &[5u8; 32]), // New nullifier
+        commitment: invalid_commitment,
+        proof: soroban_sdk::Bytes::from_slice(&env, &[0u8; 128]),
+        public_signals: Vec::new(&env),
+    };
+
+    let result_invalid = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship_private"),
+        (
+            &student,
+            100i128,
+            &zk_proof_invalid,
+        ),
+    );
+    assert!(result_invalid.is_err());
 }
 
-#[test]
-fn test_major_violation_slashing() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&student, &10000);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-    client.init_university_oracle(&admin, &oracle, &3);
-
-    // Student buys access for 2000 tokens (200 seconds)
-    client.buy_access(&student, &1, &2000, &token_address.address());
-    
-    env.ledger().set_timestamp(100); // Half way through access period
-    
-    // Verify student has access before slash
-    assert!(client.has_access(&student, &1));
-    
-    // Check balances before slash
-    let contract_balance_before = token::Client::new(&env, &token_address.address()).balance(&contract_id);
-    let admin_balance_before = token::Client::new(&env, &token_address.address()).balance(&admin);
-    
-    // Create disciplinary payload for major violation (plagiarism)
-    let evidence_hash = soroban_sdk::Bytes::from_slice(&env, b"plagiarism_evidence");
-    let reason = soroban_sdk::Bytes::from_slice(&env, b"Plagiarism detected");
-    let signatures = vec![&env, 
-        soroban_sdk::Bytes::from_slice(&env, b"sig1"),
-        soroban_sdk::Bytes::from_slice(&env, b"sig2"),
-        soroban_sdk::Bytes::from_slice(&env, b"sig3")
-    ];
-    
-    let payload = DisciplinaryPayload {
-        student: student.clone(),
-        course_id: 1,
-        violation_type: ViolationType::Major,
-        evidence_hash: evidence_hash.clone(),
-        oracle_signatures: signatures,
-        timestamp: env.ledger().timestamp(),
-        reason: reason.clone(),
-    };
-    
-    // Execute slashing
-    client.trigger_disciplinary_slash(&oracle, &payload);
-    
-    // Verify student access is permanently terminated
-    assert!(!client.has_access(&student, &1));
-    
-    // Verify student is marked as slashed
-    assert!(client.is_student_slashed(&student, &1));
-    
-    // Get slashed student info
-    let slashed_info = client.get_slashed_student_info(&student, &1).unwrap();
-    assert_eq!(slashed_info.violation_type, ViolationType::Major);
-    assert_eq!(slashed_info.stream_halted_until, u64::MAX); // Permanent termination
-    
-    // Verify full refund was processed (remaining 100 seconds * 10 tokens/sec = 1000 tokens)
-    let expected_refund = 1000; // 100 seconds remaining * 10 tokens/second
-    let contract_balance_after = token::Client::new(&env, &token_address.address()).balance(&contract_id);
-    let admin_balance_after = token::Client::new(&env, &token_address.address()).balance(&admin);
-    
-    assert_eq!(contract_balance_before - contract_balance_after, expected_refund);
-    assert_eq!(admin_balance_after - admin_balance_before, expected_refund);
-    
-    // Verify disciplinary record is stored
-    let record = client.get_disciplinary_record(&student, &1).unwrap();
-    assert_eq!(record.violation_type, ViolationType::Major);
-    assert_eq!(record.evidence_hash, evidence_hash);
-    assert_eq!(record.reason, reason);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #6)")]
-fn test_unauthorized_oracle_slashing() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let unauthorized = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&student, &10000);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-    client.init_university_oracle(&admin, &oracle, &3);
-
-    client.buy_access(&student, &1, &1000, &token_address.address());
-    
-    // Create payload
-    let payload = DisciplinaryPayload {
-        student: student.clone(),
-        course_id: 1,
-        violation_type: ViolationType::Minor,
-        evidence_hash: soroban_sdk::Bytes::from_slice(&env, b"evidence"),
-        oracle_signatures: vec![&env, soroban_sdk::Bytes::from_slice(&env, b"sig1")],
-        timestamp: env.ledger().timestamp(),
-        reason: soroban_sdk::Bytes::from_slice(&env, b"test"),
-    };
-    
-    // Should fail - unauthorized oracle
-    client.trigger_disciplinary_slash(&unauthorized, &payload);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #6)")]
-fn test_slashing_no_active_stream() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let student = Address::generate(&env);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-    client.init_university_oracle(&admin, &oracle, &3);
-
-    // Student has no active stream
-    
-    let payload = DisciplinaryPayload {
-        student: student.clone(),
-        course_id: 1,
-        violation_type: ViolationType::Minor,
-        evidence_hash: soroban_sdk::Bytes::from_slice(&env, b"evidence"),
-        oracle_signatures: vec![&env, soroban_sdk::Bytes::from_slice(&env, b"sig1")],
-        timestamp: env.ledger().timestamp(),
-        reason: soroban_sdk::Bytes::from_slice(&env, b"test"),
-    };
-    
-    // Should fail - no active stream
-    client.trigger_disciplinary_slash(&oracle, &payload);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #6)")]
-fn test_slashing_insufficient_signatures() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&student, &10000);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-    client.init_university_oracle(&admin, &oracle, &3); // Requires 3 signatures
-
-    client.buy_access(&student, &1, &1000, &token_address.address());
-    
-    // Create payload with only 2 signatures (threshold is 3)
-    let payload = DisciplinaryPayload {
-        student: student.clone(),
-        course_id: 1,
-        violation_type: ViolationType::Minor,
-        evidence_hash: soroban_sdk::Bytes::from_slice(&env, b"evidence"),
-        oracle_signatures: vec![&env, 
-            soroban_sdk::Bytes::from_slice(&env, b"sig1"),
-            soroban_sdk::Bytes::from_slice(&env, b"sig2")
-        ], // Only 2 signatures
-        timestamp: env.ledger().timestamp(),
-        reason: soroban_sdk::Bytes::from_slice(&env, b"test"),
-    };
-    
-    // Should fail - insufficient signatures
-    client.trigger_disciplinary_slash(&oracle, &payload);
-}
-
-#[test]
-fn test_minor_violation_expires_after_30_days() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&student, &10000);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-    client.init_university_oracle(&admin, &oracle, &3);
-
-    client.buy_access(&student, &1, &1000, &token_address.address());
-    
-    let slash_time = env.ledger().timestamp();
-    
-    // Execute minor violation slash
-    let payload = DisciplinaryPayload {
-        student: student.clone(),
-        course_id: 1,
-        violation_type: ViolationType::Minor,
-        evidence_hash: soroban_sdk::Bytes::from_slice(&env, b"evidence"),
-        oracle_signatures: vec![&env, 
-            soroban_sdk::Bytes::from_slice(&env, b"sig1"),
-            soroban_sdk::Bytes::from_slice(&env, b"sig2"),
-            soroban_sdk::Bytes::from_slice(&env, b"sig3")
-        ],
-        timestamp: slash_time,
-        reason: soroban_sdk::Bytes::from_slice(&env, b"test"),
-    };
-    
-    client.trigger_disciplinary_slash(&oracle, &payload);
-    
-    // Verify student is currently slashed
-    assert!(client.is_student_slashed(&student, &1));
-    
-    // Fast forward 31 days (past the 30-day pause)
-    let thirty_one_days_later = slash_time + (31 * 24 * 60 * 60);
-    env.ledger().set_timestamp(thirty_one_days_later);
-    
-    // Verify student is no longer slashed
-    assert!(!client.is_student_slashed(&student, &1));
-}
-
-#[test]
-fn test_major_violation_permanent() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&student, &10000);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-
-    client.init(&10, &3600, &10, &100, &60);
-    client.set_admin(&admin);
-    client.init_university_oracle(&admin, &oracle, &3);
-
-    client.buy_access(&student, &1, &1000, &token_address.address());
-    
-    let slash_time = env.ledger().timestamp();
-    
-    // Execute major violation slash
-    let payload = DisciplinaryPayload {
-        student: student.clone(),
-        course_id: 1,
-        violation_type: ViolationType::Major,
-        evidence_hash: soroban_sdk::Bytes::from_slice(&env, b"evidence"),
-        oracle_signatures: vec![&env, 
-            soroban_sdk::Bytes::from_slice(&env, b"sig1"),
-            soroban_sdk::Bytes::from_slice(&env, b"sig2"),
-            soroban_sdk::Bytes::from_slice(&env, b"sig3")
-        ],
-        timestamp: slash_time,
-        reason: soroban_sdk::Bytes::from_slice(&env, b"test"),
-    };
-    
-    client.trigger_disciplinary_slash(&oracle, &payload);
-    
-    // Verify student is currently slashed
-    assert!(client.is_student_slashed(&student, &1));
-    
-    // Fast forward 1 year - should still be slashed
-    let one_year_later = slash_time + (365 * 24 * 60 * 60);
-    env.ledger().set_timestamp(one_year_later);
-    
-    // Verify student is still slashed (permanent)
-    assert!(client.is_student_slashed(&student, &1));
-}

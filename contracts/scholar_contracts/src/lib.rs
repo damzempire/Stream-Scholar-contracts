@@ -431,6 +431,9 @@ pub enum DataKey {
     ZKVerificationKey, // Global verification key for GPA proofs
     ZKProofRecord(Address, u64), // student, course_id -> ZKProofRecord
     AcademicStanding(Address, u64), // student, course_id -> AcademicStanding
+    // Privacy/ZK-readiness for claims
+    Nullifier(soroban_sdk::BytesN<32>), // Prevent double-spending in private claims
+    Commitment(soroban_sdk::BytesN<32>), // Store commitments for private claims
     // Bounty system related keys
     BountyReserve(Address, u64), // student, course_id -> BountyReserve
     ClaimedMilestone(Address, u64, u64), // student, course_id, milestone_id -> claimed_at timestamp
@@ -588,6 +591,24 @@ pub enum ZKError {
     VerificationFailed,
     MalformedInputs,
     UnsupportedCurve,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PrivacyError {
+    NullifierAlreadyUsed = 1,
+    InvalidCommitment = 2,
+    ProofVerificationFailed = 3,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ZKClaimProof {
+    pub nullifier: soroban_sdk::BytesN<32>,
+    pub commitment: soroban_sdk::BytesN<32>,
+    pub proof: soroban_sdk::Bytes,
+    pub public_signals: soroban_sdk::Vec<soroban_sdk::BytesN<32>>,
 }
 
 #[derive(Debug)]
@@ -1735,7 +1756,10 @@ impl ScholarContract {
             .expect("No scholarship found");
             
         if scholarship.balance < amount {
-            env.panic_with_error(Error::InvalidAction);
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
         
         scholarship.balance -= amount;
@@ -1744,6 +1768,105 @@ impl ScholarContract {
         let client = token::Client::new(&env, &scholarship.token);
         client.transfer(&env.current_contract_address(), &payout_address, &amount);
     }
+
+    /// # Privacy-Preserving Claim Logic (ZK-Readiness)
+    /// Allows students to claim scholarships without revealing their specific claim frequency.
+    /// This uses a Nullifier to prevent double-spending and a Commitment to verify the claim.
+    pub fn claim_scholarship_private(
+        env: Env,
+        student: Address,
+        amount: i128,
+        zk_proof: ZKClaimProof,
+    ) {
+        student.require_auth();
+
+        // 1. Verify Nullifier has not been used before (Prevent double-claiming)
+        let nullifier_key = DataKey::Nullifier(zk_proof.nullifier.clone());
+        if env.storage().persistent().has(&nullifier_key) {
+            env.panic_with_error(PrivacyError::NullifierAlreadyUsed);
+        }
+
+        // 2. Verify Commitment exists (The claim is authorized)
+        let commitment_key = DataKey::Commitment(zk_proof.commitment.clone());
+        if !env.storage().persistent().has(&commitment_key) {
+            env.panic_with_error(PrivacyError::InvalidCommitment);
+        }
+
+        // 3. Verify ZK-Proof (Placeholder for Groth16 verification)
+        if !Self::verify_private_claim_proof_internal(&env, &zk_proof) {
+            env.panic_with_error(PrivacyError::ProofVerificationFailed);
+        }
+
+        // 4. Mark Nullifier as used
+        env.storage().persistent().set(&nullifier_key, &true);
+        env.storage().persistent().extend_ttl(&nullifier_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+
+        // 5. Execute transfer (standard logic from here)
+        let mut scholarship: Scholarship = env.storage().instance()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if scholarship.balance < amount {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        scholarship.balance -= amount;
+        env.storage().instance().set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        let payout_address: Address = env.storage().instance()
+            .get(&DataKey::AuthorizedPayout(student.clone()))
+            .unwrap_or(student.clone());
+
+        let client = token::Client::new(&env, &scholarship.token);
+        client.transfer(&env.current_contract_address(), &payout_address, &amount);
+
+        // Emit privacy-preserving event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "PrivateClaim"), student),
+            amount,
+        );
+    }
+
+    /// Store a commitment for a future private claim.
+    /// Usually called by the funder or an automated system after verifying educational milestones.
+    pub fn store_claim_commitment(env: Env, admin: Address, commitment: soroban_sdk::BytesN<32>) {
+        admin.require_auth();
+        
+        // Verify caller is admin or authorized funder
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        let commitment_key = DataKey::Commitment(commitment);
+        env.storage().persistent().set(&commitment_key, &true);
+        env.storage().persistent().extend_ttl(&commitment_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    }
+
+    fn verify_private_claim_proof_internal(env: &Env, _proof: &ZKClaimProof) -> bool {
+        // In a real implementation, this would use ark-groth16 to verify the proof
+        // against the stored verification key and public signals.
+        // For architectural readiness, we perform format validation.
+        
+        if _proof.proof.len() < 128 { // Minimum size for a Groth16 proof (A, B, C points)
+            return false;
+        }
+        
+        if _proof.public_signals.len() == 0 {
+            return false;
+        }
+
+        // Architectural placeholder: return true for now to allow integration testing
+        true
+    }
+
 
     // --- Issue #114: Cross-Project Reputation Bonus ---
 

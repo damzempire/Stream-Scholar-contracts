@@ -116,6 +116,7 @@ coverage/
 tmp/
 temp/
 
+
 # Backup files
 *.backup
 *.bak
@@ -131,3 +132,6 @@ local-config.json
 # Docker
 .dockerignore
 docker-compose.override.yml
+
+#Agent Command
+AGENTS.md
