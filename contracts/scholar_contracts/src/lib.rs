@@ -19,6 +19,7 @@ pub enum Event {
     StreamHalted(Address, u64, u64),     // student, course_id, reason_timestamp
     ZKProofVerified(Address, bool),      // student, success_flag
     BountyClaimed(Address, u64, i128),    // student, milestone_id, amount
+    StudentSlashed(Address, u64, u64, i128, u64), // student, course_id, violation_type, refunded_amount, timestamp
 }
 
 #[contracttype]
@@ -46,6 +47,36 @@ pub struct BountyReserve {
     pub balance: i128,
     pub token: Address,
     pub course_id: u64,
+}
+
+#[contracttype]
+pub enum ViolationType {
+    Minor = 1,    // Pause stream for 30 days
+    Major = 2,    // Terminate stream (plagiarism)
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DisciplinaryPayload {
+    pub student: Address,
+    pub course_id: u64,
+    pub violation_type: ViolationType,
+    pub evidence_hash: soroban_sdk::Bytes,
+    pub oracle_signatures: Vec<soroban_sdk::Bytes>,
+    pub timestamp: u64,
+    pub reason: soroban_sdk::Bytes,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SlashedStudent {
+    pub student: Address,
+    pub course_id: u64,
+    pub violation_type: ViolationType,
+    pub slashed_at: u64,
+    pub stream_halted_until: u64,
+    pub refunded_amount: i128,
+    pub original_donor: Address,
 }
 
 #[contracttype]
@@ -92,6 +123,11 @@ pub enum DataKey {
     // Bounty system related keys
     BountyReserve(Address, u64), // student, course_id -> BountyReserve
     ClaimedMilestone(Address, u64, u64), // student, course_id, milestone_id -> claimed_at timestamp
+    // Disciplinary slashing related keys
+    UniversityOracle,
+    OracleMultiSigThreshold,
+    SlashedStudent(Address, u64), // student, course_id -> SlashedStudent
+    DisciplinaryRecord(Address, u64), // student, course_id -> DisciplinaryPayload
 }
 
 #[contracttype]
@@ -249,6 +285,15 @@ pub enum BountyError {
     InsufficientBountyReserve,
     InvalidSignature,
     StreamNotActive,
+}
+
+#[derive(Debug)]
+pub enum SlashingError {
+    UnauthorizedOracle,
+    InvalidViolationType,
+    NoActiveStream,
+    InsufficientBalance,
+    InvalidPayload,
 }
 
 #[contract]
@@ -2614,6 +2659,398 @@ impl ScholarContract {
         
         let end_instructions = env.budget().cpu_instructions_consumed();
         end_instructions - start_instructions
+    }
+
+    // Disciplinary Slashing System
+
+    /// Initialize University Oracle for disciplinary actions
+    pub fn init_university_oracle(
+        env: Env,
+        admin: Address,
+        oracle_address: Address,
+        multi_sig_threshold: u32,
+    ) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Validate threshold (must be at least 2 for multi-sig)
+        if multi_sig_threshold < 2 {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::UniversityOracle, &oracle_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleMultiSigThreshold, &multi_sig_threshold);
+    }
+
+    /// Trigger disciplinary slashing for academic misconduct
+    /// Only callable by University Oracle with multi-signature authorization
+    pub fn trigger_disciplinary_slash(
+        env: Env,
+        oracle: Address,
+        payload: DisciplinaryPayload,
+    ) {
+        oracle.require_auth();
+        
+        // Verify caller is authorized University Oracle
+        Self::verify_oracle_authorization(&env, &oracle);
+        
+        // Validate payload
+        Self::validate_disciplinary_payload(&env, &payload);
+        
+        // Check if student has active stream/scholarship
+        let access_key = DataKey::Access(payload.student.clone(), payload.course_id);
+        let access: Option<Access> = env.storage().persistent().get(&access_key);
+        
+        if access.is_none() {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        let current_time = env.ledger().timestamp();
+        
+        // Calculate remaining unvested balance
+        let remaining_balance = Self::calculate_remaining_unvested_balance(
+            &env,
+            &payload.student,
+            payload.course_id,
+            current_time,
+        );
+        
+        if remaining_balance <= 0 {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // Execute slashing based on violation type
+        let (stream_halted_until, refunded_amount) = match payload.violation_type {
+            ViolationType::Minor => {
+                // Minor violation: pause stream for 30 days
+                let pause_duration = 30 * 24 * 60 * 60; // 30 days in seconds
+                let halt_until = current_time + pause_duration;
+                (halt_until, remaining_balance)
+            }
+            ViolationType::Major => {
+                // Major violation (plagiarism): terminate stream permanently
+                (u64::MAX, remaining_balance) // u64::MAX represents permanent halt
+            }
+        };
+        
+        // Halt the stream immediately
+        Self::halt_student_stream(
+            &env,
+            &payload.student,
+            payload.course_id,
+            stream_halted_until,
+        );
+        
+        // Calculate and execute refund to original donor
+        let original_donor = Self::identify_original_donor(&env, &payload.student, payload.course_id);
+        Self::execute_refund_to_donor(
+            &env,
+            &original_donor,
+            refunded_amount,
+            &access.unwrap().token,
+        );
+        
+        // Store disciplinary record
+        let slashed_student = SlashedStudent {
+            student: payload.student.clone(),
+            course_id: payload.course_id,
+            violation_type: payload.violation_type.clone(),
+            slashed_at: current_time,
+            stream_halted_until,
+            refunded_amount,
+            original_donor: original_donor.clone(),
+        };
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashedStudent(payload.student.clone(), payload.course_id), &slashed_student);
+        env.storage().persistent().extend_ttl(
+            &DataKey::SlashedStudent(payload.student.clone(), payload.course_id),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+        
+        // Store disciplinary payload for audit trail
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisciplinaryRecord(payload.student.clone(), payload.course_id), &payload);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DisciplinaryRecord(payload.student.clone(), payload.course_id),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+        
+        // Emit StudentSlashed event
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "StudentSlashed"),
+                payload.student.clone(),
+                payload.course_id,
+            ),
+            (payload.violation_type as u64, refunded_amount, current_time),
+        );
+    }
+
+    /// Verify Oracle authorization with multi-signature check
+    fn verify_oracle_authorization(env: &Env, caller: &Address) {
+        let oracle_address: Option<Address> = env.storage().instance().get(&DataKey::UniversityOracle);
+        
+        if oracle_address.is_none() || oracle_address.unwrap() != *caller {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // In a full implementation, you would verify multi-signature here
+        // For now, we accept that the oracle address itself represents the multi-sig authority
+        // TODO: Implement proper multi-signature verification
+    }
+
+    /// Validate disciplinary payload structure and content
+    fn validate_disciplinary_payload(env: &Env, payload: &DisciplinaryPayload) {
+        let current_time = env.ledger().timestamp();
+        
+        // Check timestamp is not too old (within 24 hours)
+        if current_time > payload.timestamp + (24 * 60 * 60) {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // Check timestamp is not in the future
+        if payload.timestamp > current_time + 300 { // 5 minute tolerance
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // Validate evidence hash is not empty
+        if payload.evidence_hash.is_empty() {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // Validate reason is not empty
+        if payload.reason.is_empty() {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // Validate oracle signatures (simplified check)
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleMultiSigThreshold)
+            .unwrap_or(2);
+            
+        if payload.oracle_signatures.len() < threshold as usize {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+    }
+
+    /// Calculate remaining unvested balance for a student's scholarship
+    fn calculate_remaining_unvested_balance(
+        env: &Env,
+        student: &Address,
+        course_id: u64,
+        current_time: u64,
+    ) -> i128 {
+        let access_key = DataKey::Access(student.clone(), course_id);
+        let access: Access = env
+            .storage()
+            .persistent()
+            .get(&access_key)
+            .unwrap_or_else(|| panic!("No access record found"));
+        
+        // If access has expired, no remaining balance
+        if current_time >= access.expiry_time {
+            return 0;
+        }
+        
+        let remaining_seconds = access.expiry_time - current_time;
+        let rate = Self::calculate_dynamic_rate(env.clone(), student.clone(), course_id);
+        
+        (remaining_seconds as i128) * rate
+    }
+
+    /// Halt student's stream for specified duration
+    fn halt_student_stream(
+        env: &Env,
+        student: &Address,
+        course_id: u64,
+        halted_until: u64,
+    ) {
+        let access_key = DataKey::Access(student.clone(), course_id);
+        let mut access: Access = env
+            .storage()
+            .persistent()
+            .get(&access_key)
+            .unwrap_or_else(|| panic!("No access record found"));
+        
+        // Set expiry to halt time (for temporary pause) or 0 for permanent termination
+        access.expiry_time = if halted_until == u64::MAX {
+            0 // Permanent termination
+        } else {
+            halted_until // Temporary pause
+        };
+        
+        env.storage().persistent().set(&access_key, &access);
+        env.storage().persistent().extend_ttl(
+            &access_key,
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+        
+        // Also update PoA state to reflect halt
+        let poa_state_key = DataKey::StudentPoAState(student.clone(), course_id);
+        let mut poa_state: StudentPoAState = env
+            .storage()
+            .persistent()
+            .get(&poa_state_key)
+            .unwrap_or(StudentPoAState {
+                current_state: CheckpointState::Halted,
+                last_checkpoint_submitted: 0,
+                missed_checkpoints: 0,
+                grace_period_end: 0,
+                stream_halted_until: halted_until,
+            });
+        
+        poa_state.current_state = CheckpointState::Halted;
+        poa_state.stream_halted_until = halted_until;
+        
+        env.storage().persistent().set(&poa_state_key, &poa_state);
+        env.storage().persistent().extend_ttl(
+            &poa_state_key,
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    /// Identify original donor for refund (simplified implementation)
+    fn identify_original_donor(env: &Env, student: &Address, course_id: u64) -> Address {
+        // In a full implementation, you would track the original funder
+        // For now, we'll use a placeholder logic that returns the admin as donor
+        // This should be replaced with proper donor tracking
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        admin
+    }
+
+    /// Execute refund of slashed funds to original donor
+    fn execute_refund_to_donor(
+        env: &Env,
+        donor: &Address,
+        amount: i128,
+        token: &Address,
+    ) {
+        if amount <= 0 {
+            return;
+        }
+        
+        let client = token::Client::new(env, token);
+        client.transfer(&env.current_contract_address(), donor, &amount);
+    }
+
+    /// Get disciplinary record for a student
+    pub fn get_disciplinary_record(
+        env: Env,
+        student: Address,
+        course_id: u64,
+    ) -> Option<DisciplinaryPayload> {
+        let key = DataKey::DisciplinaryRecord(student.clone(), course_id);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key)
+        } else {
+            None
+        }
+    }
+
+    /// Get slashed student information
+    pub fn get_slashed_student_info(
+        env: Env,
+        student: Address,
+        course_id: u64,
+    ) -> Option<SlashedStudent> {
+        let key = DataKey::SlashedStudent(student.clone(), course_id);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key)
+        } else {
+            None
+        }
+    }
+
+    /// Check if student is currently under disciplinary action
+    pub fn is_student_slashed(
+        env: Env,
+        student: Address,
+        course_id: u64,
+    ) -> bool {
+        let key = DataKey::SlashedStudent(student.clone(), course_id);
+        if env.storage().persistent().has(&key) {
+            let slashed_student: SlashedStudent = env.storage().persistent().get(&key).unwrap();
+            let current_time = env.ledger().timestamp();
+            
+            // Check if the slash is still active (for temporary pauses)
+            if slashed_student.stream_halted_until != u64::MAX {
+                current_time < slashed_student.stream_halted_until
+            } else {
+                true // Permanent slash
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Get University Oracle configuration
+    pub fn get_oracle_config(env: Env) -> (Option<Address>, Option<u32>) {
+        let oracle: Option<Address> = env.storage().instance().get(&DataKey::UniversityOracle);
+        let threshold: Option<u32> = env.storage().instance().get(&DataKey::OracleMultiSigThreshold);
+        (oracle, threshold)
     }
 }
 
