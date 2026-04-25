@@ -23,7 +23,9 @@ fn test_scholarship_flow() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     // Initialize the contract with new parameters
-    client.init(&10, &3600, &10, &100, &60); // base_rate, threshold, discount%, min_deposit, heartbeat_interval
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Student buys access to course 1 for 100 tokens (should be 10 seconds at base rate)
     client.buy_access(&student, &1, &100, &token_address.address());
