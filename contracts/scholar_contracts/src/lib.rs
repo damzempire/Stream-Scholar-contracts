@@ -64,6 +64,22 @@ const QF_MIN_CONTRIBUTION: i128 = 1_0000000; // 1 XLM minimum contribution
 const QF_MATCHING_POOL_RESERVE: i128 = 10000_0000000; // 10,000 XLM matching pool reserve
 const QF_MAX_PROJECTS: u64 = 500; // Max projects per round
 
+// Issue #186: Maximum TVL & Withdrawal Velocity Limits
+const MAX_PROTOCOL_TVL: i128 = 1_000_000_0000000; // 1,000,000 XLM hard cap
+const VELOCITY_LIMIT_BPS: i128 = 1000; // 10% of TVL per 24h
+const VELOCITY_WINDOW: u64 = 86400; // 24 hours in seconds
+
+// Issue #187: Storage Rent Sweeper & Auto-Bumper
+const DEPLETED_SWEEP_THRESHOLD: u64 = 7776000; // 90 days in seconds
+const RENT_BUMP_AMOUNT: i128 = 1; // 1 stroop micro-fraction for TTL extension
+
+// Issue #192: Quadratic Voting for Community Grants
+const QUADRATIC_ROUND_DURATION: u64 = 2592000; // 30-day voting round
+
+// Issue #197: Dynamic Fee Adjustment via DAO
+const MAX_FEE_BPS: u32 = 500; // 5% maximum fee cap
+const FEE_EPOCH_DURATION: u64 = 2592000; // 30-day epoch between fee updates
+
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, IntoVal, Symbol, Vec, BytesN};
 use expiry_math::checked_access_expiry;
 
@@ -72,6 +88,17 @@ const LEDGER_BUMP_EXTEND: u32 = 789012; // Example value
 const GPA_BONUS_THRESHOLD: u64 = 35; // Example 3.5 GPA
 const GPA_BONUS_PERCENTAGE_PER_POINT: u64 = 20; // Example 20%
 
+// --- Constants for TTL Management ---
+const LEDGER_BUMP_THRESHOLD: u32 = 123456; // Example threshold
+const LEDGER_BUMP_EXTEND: u32 = 789012;    // Example extension
+const MAX_COURSE_REGISTRY_SIZE: u64 = 1000; // Maximum number of courses to prevent gas limit issues
+const EARLY_DROP_WINDOW_SECONDS: u64 = 300; // 5 minutes
+const DEAD_MANS_SWITCH_SECONDS: u64 = 365 * 24 * 60 * 60; // 365 days
+const APPEAL_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
+
+// GPA Bonus Constants
+const GPA_BONUS_THRESHOLD: u64 = 35; // 3.5 GPA threshold (stored as 35 to avoid floating point)
+const GPA_BONUS_PERCENTAGE_PER_POINT: u64 = 20; // 2% per 0.1 GPA (20% per 1.0 GPA)
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -352,6 +379,27 @@ pub struct MatchingDistribution {
     pub project_owner: Address,
 }
 
+// Issue #192: Quadratic Voting for Community Grants
+#[contracttype]
+#[derive(Clone)]
+pub struct QuadraticRound {
+    pub round_id: u64,
+    pub token: Address,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub treasury_balance: i128,
+    pub is_finalized: bool,
+}
+
+// Issue #197: Dynamic Fee Adjustment via DAO
+#[contracttype]
+#[derive(Clone)]
+pub struct FeeParameters {
+    pub fee_bps: u32,
+    pub updated_at: u64,
+    pub updated_by: Address,
+}
+
 
 #[contracttype]
 #[derive(Clone)]
@@ -585,6 +633,18 @@ pub struct PoAConfig {
     pub is_active: bool,
 }
 
+// Slashing Appeal struct (#193)
+#[contracttype]
+#[derive(Clone)]
+pub struct SlashingAppeal {
+    pub student: Address,
+    pub counter_oracle: Address,
+    pub submitted_at: u64,
+    pub is_resolved: bool,
+    pub appeal_granted: bool,
+}
+
+// Research Grant Milestone Escrow structs
 #[contracttype]
 #[derive(Clone)]
 pub struct AttendanceCheckpoint {
@@ -963,9 +1023,10 @@ impl ScholarContract {
         );
     }
 
-
-        let state_key = DataKey::StudentPoAState(student.clone(), course_id);
-        let poa_state: Option<StudentPoAState> = env.storage().persistent().get(&state_key);
+    pub fn heartbeat(env: Env, student: Address, course_id: u64, _signature: soroban_sdk::Bytes) {
+        student.require_auth();
+        let current_time = env.ledger().timestamp();
+        let access_key = DataKey::Access(student.clone(), course_id);
         
         if let Some(state) = poa_state {
             let current_time = env.ledger().timestamp();
@@ -979,39 +1040,55 @@ impl ScholarContract {
             if current_time < state.grace_period_end {
                 return false;
             }
-            
-            // Check if delinquent
-            if state.current_state == CheckpointState::Delinquent {
-                return false;
-            }
-            
-            true
-        } else {
-            // No PoA state yet, assume compliant
-            true
         }
+
+        env.storage().persistent().set(&access_key, &access);
+        env.storage().persistent().extend_ttl(&access_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
     }
 
-    pub fn get_student_poa_state(env: Env, student: Address, course_id: u64) -> StudentPoAState {
-        let state_key = DataKey::StudentPoAState(student.clone(), course_id);
-        if env.storage().persistent().has(&state_key) {
-            env.storage().persistent().extend_ttl(&state_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
-            env.storage().persistent().get(&state_key).unwrap_or(StudentPoAState {
-                current_state: CheckpointState::Compliant,
-                last_checkpoint_submitted: 0,
-                missed_checkpoints: 0,
-                grace_period_end: 0,
-                stream_halted_until: 0,
-            })
-        } else {
-            StudentPoAState {
-                current_state: CheckpointState::Compliant,
-                last_checkpoint_submitted: 0,
-                missed_checkpoints: 0,
-                grace_period_end: 0,
-                stream_halted_until: 0,
+    pub fn has_access(env: Env, student: Address, course_id: u64) -> bool {
+        // Check if student scholarship is disputed
+        if let Some(scholarship) = env.storage().persistent().get(&DataKey::Scholarship(student.clone())) {
+            if scholarship.is_disputed {
+                return false;
             }
         }
+
+        // Check if course is globally vetoed
+        let is_globally_vetoed: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VetoedCourseGlobal(course_id))
+            .unwrap_or(false);
+        if is_globally_vetoed {
+            return false;
+        }
+
+        // Check if course is vetoed for this student
+        let is_vetoed: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VetoedCourse(student.clone(), course_id))
+            .unwrap_or(false);
+        if is_vetoed {
+            return false;
+        }
+
+        // Check subscription first
+        if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
+            return true;
+        }
+
+        // Check direct access record
+        let access: Option<Access> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Access(student.clone(), course_id));
+        if let Some(a) = access {
+            return env.ledger().timestamp() < a.expiry_time;
+        }
+
+        false
     }
 
     pub fn process_missed_checkpoints(env: Env) {
@@ -1051,10 +1128,35 @@ impl ScholarContract {
             effective_rate = (effective_rate * 98) / 100;
         }
 
-        // Apply GPA Multiplier
-        let gpa_multiplier: i128 = env.storage().instance().get(&DataKey::GpaMultiplier(student.clone())).unwrap_or(10000); // Default 100% in bps
-        if gpa_multiplier == 0 {
-            return 0; // Paused
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        Self::touch_admin_heartbeat(&env);
+    }
+
+    fn is_admin(env: &Env, caller: &Address) -> bool {
+        let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        admin.map_or(false, |a| a == *caller)
+    }
+
+    fn touch_admin_heartbeat(env: &Env) {
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminHeartbeat, &env.ledger().timestamp());
+    }
+
+    pub fn set_teacher(env: Env, admin: Address, teacher: Address, status: bool) {
+        admin.require_auth();
+
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
         }
         effective_rate = (effective_rate * gpa_multiplier) / 10000;
 
