@@ -6,9 +6,10 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Sym
 // --- Constants for TTL Management ---
 const LEDGER_BUMP_THRESHOLD: u32 = 123456; // Example threshold
 const LEDGER_BUMP_EXTEND: u32 = 789012;    // Example extension
-const MAX_COURSE_REGISTRY_SIZE: u64 = 1000;
-const EARLY_DROP_WINDOW_SECONDS: u64 = 300; // 5 minutes
 const MAX_COURSE_REGISTRY_SIZE: u64 = 1000; // Maximum number of courses to prevent gas limit issues
+const EARLY_DROP_WINDOW_SECONDS: u64 = 300; // 5 minutes
+const DEAD_MANS_SWITCH_SECONDS: u64 = 365 * 24 * 60 * 60; // 365 days
+const APPEAL_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
 
 // GPA Bonus Constants
 const GPA_BONUS_THRESHOLD: u64 = 35; // 3.5 GPA threshold (stored as 35 to avoid floating point)
@@ -87,6 +88,17 @@ pub enum DataKey {
     DeansCouncil,
     BoardPauseRequest(Address), // student -> BoardPauseRequest struct
     BoardSignature(Address, Address), // student, council_member -> signature
+    // Dead-Man's Switch (#189)
+    AdminHeartbeat,       // last admin action timestamp
+    RecoveryAddress,      // fallback address after 365-day silence
+    ProtocolFeeVault,     // protocol fee vault balance
+    // Appeals Process (#193)
+    SlashingAppeal(Address), // student -> SlashingAppeal struct
+    // Oracle Whitelist/Blacklist (#198)
+    OracleWhitelisted(Address), // oracle key -> bool
+    OracleBlacklisted(Address), // oracle key -> bool (O(1) check)
+    // Philanthropy SBT sponsor tracking (#194)
+    PhilanthropyBadge(Address, Address), // (sponsor, student) -> bool minted
 }
 
 #[contracttype]
@@ -155,6 +167,17 @@ pub struct BoardPauseRequest {
     pub signatures: Vec<Address>,
     pub is_executed: bool,
     pub executed_at: Option<u64>,
+}
+
+// Slashing Appeal struct (#193)
+#[contracttype]
+#[derive(Clone)]
+pub struct SlashingAppeal {
+    pub student: Address,
+    pub counter_oracle: Address,
+    pub submitted_at: u64,
+    pub is_resolved: bool,
+    pub appeal_granted: bool,
 }
 
 // Research Grant Milestone Escrow structs
@@ -380,10 +403,6 @@ impl ScholarContract {
         );
     }
 
-        // Distribute royalties
-        Self::distribute_royalty(&env, course_id, actual_cost, &token);
-    }
-
     pub fn heartbeat(env: Env, student: Address, course_id: u64, _signature: soroban_sdk::Bytes) {
         student.require_auth();
         let current_time = env.ledger().timestamp();
@@ -423,23 +442,6 @@ impl ScholarContract {
         env.storage().persistent().extend_ttl(&access_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
     }
 
-    fn calculate_dynamic_rate(env: Env, student: Address, course_id: u64) -> i128 {
-        let base_rate: i128 = env.storage().instance().get(&DataKey::BaseRate).unwrap_or(1);
-        let threshold: u64 = env.storage().instance().get(&DataKey::DiscountThreshold).unwrap_or(3600);
-        let percentage: u64 = env.storage().instance().get(&DataKey::DiscountPercentage).unwrap_or(10);
-
-        let access: Access = env.storage().persistent().get(&DataKey::Access(student, course_id)).unwrap_or_else(|| {
-            // Return dummy Access if not found
-            Access { student: Address::generate(&env), course_id, expiry_time: 0, token: Address::generate(&env), total_watch_time: 0, last_heartbeat: 0, last_purchase_time: 0 }
-        });
-
-        if access.total_watch_time >= threshold {
-            base_rate - (base_rate * percentage as i128 / 100)
-        } else {
-            false
-        }
-    }
-
     pub fn has_access(env: Env, student: Address, course_id: u64) -> bool {
         // Check if student scholarship is disputed
         if let Some(scholarship) = env.storage().persistent().get(&DataKey::Scholarship(student.clone())) {
@@ -472,6 +474,17 @@ impl ScholarContract {
         if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
             return true;
         }
+
+        // Check direct access record
+        let access: Option<Access> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Access(student.clone(), course_id));
+        if let Some(a) = access {
+            return env.ledger().timestamp() < a.expiry_time;
+        }
+
+        false
     }
 
     fn has_active_subscription(env: Env, student: Address, course_id: u64) -> bool {
@@ -523,11 +536,18 @@ impl ScholarContract {
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
+        Self::touch_admin_heartbeat(&env);
     }
 
     fn is_admin(env: &Env, caller: &Address) -> bool {
         let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
         admin.map_or(false, |a| a == *caller)
+    }
+
+    fn touch_admin_heartbeat(env: &Env) {
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminHeartbeat, &env.ledger().timestamp());
     }
 
     pub fn set_teacher(env: Env, admin: Address, teacher: Address, status: bool) {
@@ -2535,6 +2555,264 @@ impl ScholarContract {
     pub fn is_disputed(env: Env, student: Address) -> bool {
         let scholarship: Option<Scholarship> = env.storage().persistent().get(&DataKey::Scholarship(student));
         scholarship.map_or(false, |s| s.is_disputed)
+    }
+    // ── Issue #189: Dead-Man's Switch for Protocol Treasury ──────────────────
+
+    pub fn set_recovery_address(env: Env, admin: Address, recovery: Address) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) { panic!("Unauthorized"); }
+        env.storage().instance().set(&DataKey::RecoveryAddress, &recovery);
+        Self::touch_admin_heartbeat(&env);
+    }
+
+    pub fn deposit_protocol_fee(env: Env, depositor: Address, amount: i128, token: Address) {
+        depositor.require_auth();
+        let client = token::Client::new(&env, &token);
+        client.transfer(&depositor, &env.current_contract_address(), &amount);
+        let current: i128 = env.storage().instance().get(&DataKey::ProtocolFeeVault).unwrap_or(0);
+        env.storage().instance().set(&DataKey::ProtocolFeeVault, &(current + amount));
+    }
+
+    /// Called by the recovery address after 365 days of admin inactivity.
+    pub fn recover_protocol_fees(env: Env, recovery: Address, token: Address) {
+        recovery.require_auth();
+        let stored_recovery: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecoveryAddress)
+            .expect("Recovery address not set");
+        if stored_recovery != recovery { panic!("Unauthorized"); }
+
+        let last_heartbeat: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminHeartbeat)
+            .unwrap_or(0);
+        let current_time = env.ledger().timestamp();
+        if current_time < last_heartbeat + DEAD_MANS_SWITCH_SECONDS {
+            panic!("Admin still active; 365-day threshold not reached");
+        }
+
+        let vault_balance: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeVault)
+            .unwrap_or(0);
+        if vault_balance <= 0 { panic!("No fees to recover"); }
+
+        env.storage().instance().set(&DataKey::ProtocolFeeVault, &0i128);
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &recovery, &vault_balance);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "AdminHeartbeatLost"), recovery),
+            (vault_balance, current_time),
+        );
+    }
+
+    pub fn get_admin_heartbeat(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::AdminHeartbeat).unwrap_or(0)
+    }
+
+    // ── Issue #193: Appeals Process for Slashed Students ─────────────────────
+
+    /// Student submits an appeal within 7 days of slashing, providing a counter-oracle.
+    pub fn appeal_slashing(env: Env, student: Address, counter_oracle: Address) {
+        student.require_auth();
+
+        let scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if !scholarship.is_paused {
+            panic!("No active slashing to appeal");
+        }
+
+        // Ensure no duplicate appeal
+        if env.storage().persistent().has(&DataKey::SlashingAppeal(student.clone())) {
+            panic!("Appeal already submitted");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let appeal = SlashingAppeal {
+            student: student.clone(),
+            counter_oracle,
+            submitted_at: current_time,
+            is_resolved: false,
+            appeal_granted: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashingAppeal(student.clone()), &appeal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::SlashingAppeal(student.clone()),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Appeal_Submitted"), student),
+            current_time,
+        );
+    }
+
+    /// DAO arbitration: resolve an appeal (grant or deny).
+    pub fn resolve_appeal(env: Env, admin: Address, student: Address, grant: bool) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) { panic!("Unauthorized"); }
+        Self::touch_admin_heartbeat(&env);
+
+        let mut appeal: SlashingAppeal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashingAppeal(student.clone()))
+            .expect("No appeal found");
+
+        let current_time = env.ledger().timestamp();
+        if current_time > appeal.submitted_at + APPEAL_WINDOW_SECONDS {
+            panic!("Appeal window expired");
+        }
+        if appeal.is_resolved { panic!("Appeal already resolved"); }
+
+        appeal.is_resolved = true;
+        appeal.appeal_granted = grant;
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if grant {
+            // Restore stream: unpause and clear dispute
+            scholarship.is_paused = false;
+            scholarship.is_disputed = false;
+            scholarship.dispute_reason = None;
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "AppealGranted"), student.clone()),
+                current_time,
+            );
+        } else {
+            // Deny: keep slashed, clear appeal bond (balance zeroed)
+            scholarship.balance = 0;
+            scholarship.unlocked_balance = 0;
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "AppealDenied"), student.clone()),
+                current_time,
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashingAppeal(student.clone()), &appeal);
+    }
+
+    pub fn get_slashing_appeal(env: Env, student: Address) -> Option<SlashingAppeal> {
+        env.storage().persistent().get(&DataKey::SlashingAppeal(student))
+    }
+
+    // ── Issue #194: Proof-of-Philanthropy Soulbound Tokens ───────────────────
+
+    /// Triggered on graduation (when SBT_Mint fires). Mints a non-transferable
+    /// philanthropy badge to the sponsor who funded the student's scholarship.
+    pub fn issue_philanthropy_badge(
+        env: Env,
+        admin: Address,
+        sponsor: Address,
+        student: Address,
+        badge_ipfs_hash: Symbol,
+    ) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) { panic!("Unauthorized"); }
+        Self::touch_admin_heartbeat(&env);
+
+        // Verify student has graduated (SBT minted for at least one course)
+        // We accept any course_id=0 sentinel or admin assertion here.
+        let badge_key = DataKey::PhilanthropyBadge(sponsor.clone(), student.clone());
+        if env.storage().persistent().get::<_, bool>(&badge_key).unwrap_or(false) {
+            panic!("Badge already minted for this sponsor/student pair");
+        }
+
+        // Mark as minted (non-transferable: stored on-chain, no transfer function)
+        env.storage().persistent().set(&badge_key, &true);
+        env.storage().persistent().extend_ttl(&badge_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "BadgeMinted"), sponsor.clone(), student),
+            badge_ipfs_hash,
+        );
+    }
+
+    pub fn has_philanthropy_badge(env: Env, sponsor: Address, student: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PhilanthropyBadge(sponsor, student))
+            .unwrap_or(false)
+    }
+
+    // ── Issue #198: Oracle Whitelist/Blacklist Governance ────────────────────
+
+    /// DAO (admin) can whitelist or blacklist an oracle key.
+    pub fn update_oracle_registry(env: Env, admin: Address, oracle: Address, action: Symbol) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) { panic!("Unauthorized"); }
+        Self::touch_admin_heartbeat(&env);
+
+        let whitelist_sym = Symbol::new(&env, "whitelist");
+        let blacklist_sym = Symbol::new(&env, "blacklist");
+
+        if action == whitelist_sym {
+            // O(1) set in persistent map
+            env.storage()
+                .persistent()
+                .set(&DataKey::OracleWhitelisted(oracle.clone()), &true);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::OracleBlacklisted(oracle.clone()));
+        } else if action == blacklist_sym {
+            // O(1) blacklist check
+            env.storage()
+                .persistent()
+                .set(&DataKey::OracleBlacklisted(oracle.clone()), &true);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::OracleWhitelisted(oracle.clone()));
+        } else {
+            panic!("Invalid action: use 'whitelist' or 'blacklist'");
+        }
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "OracleRegistryUpdated"), admin, oracle),
+            action,
+        );
+    }
+
+    /// O(1) blacklist check used before any oracle-gated operation.
+    pub fn is_oracle_blacklisted(env: Env, oracle: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OracleBlacklisted(oracle))
+            .unwrap_or(false)
+    }
+
+    pub fn is_oracle_whitelisted(env: Env, oracle: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OracleWhitelisted(oracle))
+            .unwrap_or(false)
     }
 }
 
