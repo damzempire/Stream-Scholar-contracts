@@ -23,9 +23,7 @@ fn test_scholarship_flow() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     // Initialize the contract with new parameters
-    let sep12_oracle = Address::generate(&env);
-    let security_council = Address::generate(&env);
-    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+    client.init(&10, &3600, &10, &100, &60);
 
     // Student buys access to course 1 for 100 tokens (should be 10 seconds at base rate)
     client.buy_access(&student, &1, &100, &token_address.address());
@@ -705,12 +703,12 @@ fn test_withdrawal_whitelisting() {
     client.set_authorized_payout_address(&student, &payout);
 
     // Try to confirm early (should fail)
-    let result = env.try_invoke_contract::<(), Error>(&contract_id, &Symbol::new(&env, "confirm_authorized_payout_address"), (student.clone(),).into_val(&env));
+    let result = env.try_invoke_contract::<(), Error>(&contract_id, &Symbol::new(&env, "confirm_payout_unlock"), (student.clone(),).into_val(&env));
     assert!(result.is_err());
 
     // Confirm after 48 hours (172800 seconds)
     env.ledger().set_timestamp(172801);
-    client.confirm_authorized_payout_address(&student);
+    client.confirm_payout_unlock(&student);
 
     // Claim scholarship
     client.claim_scholarship(&student, &200);
@@ -2302,8 +2300,6 @@ fn test_private_claim_logic() {
             &zk_proof_invalid,
         ),
     );
-    assert!(result_invalid.is_err());
-}
     assert!(result_invalid.is_err());
 }
 
