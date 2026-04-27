@@ -23,9 +23,7 @@ fn test_scholarship_flow() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     // Initialize the contract with new parameters
-    let sep12_oracle = Address::generate(&env);
-    let security_council = Address::generate(&env);
-    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+    client.init(&10, &3600, &10, &100, &60);
 
     // Student buys access to course 1 for 100 tokens (should be 10 seconds at base rate)
     client.buy_access(&student, &1, &100, &token_address.address());
@@ -2302,8 +2300,6 @@ fn test_private_claim_logic() {
             &zk_proof_invalid,
         ),
     );
-    assert!(result_invalid.is_err());
-}
     assert!(result_invalid.is_err());
 }
 

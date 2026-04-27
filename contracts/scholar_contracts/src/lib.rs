@@ -4890,6 +4890,121 @@ impl ScholarContract {
     pub fn get_research_bonus_fund(env: Env) -> Option<ResearchBonusFund> {
         env.storage().instance().get(&DataKey::ResearchBonusFund)
     }
+
+    // --- Test-only harness: snapshots / perf benches expect init + buy_access + buy_subscription ---
+    #[cfg(test)]
+    pub fn init(
+        env: Env,
+        base_rate: i128,
+        watch_threshold: u64,
+        discount_percentage: u32,
+        min_deposit: i128,
+        heartbeat_interval: u64,
+    ) {
+        env.storage().instance().set(&DataKey::BaseRate, &base_rate);
+        env.storage()
+            .instance()
+            .set(&DataKey::DiscountThreshold, &watch_threshold);
+        env.storage().instance().set(
+            &DataKey::DiscountPercentage,
+            &(discount_percentage as u64),
+        );
+        env.storage().instance().set(&DataKey::MinDeposit, &min_deposit);
+        env.storage()
+            .instance()
+            .set(&DataKey::HeartbeatInterval, &heartbeat_interval);
+        env.storage().instance().set(&DataKey::IsInitialized, &true);
+    }
+
+    #[cfg(test)]
+    pub fn buy_access(
+        env: Env,
+        student: Address,
+        course_id: u64,
+        payment: i128,
+        token: Address,
+    ) {
+        student.require_auth();
+        let min_dep: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinDeposit)
+            .unwrap_or(0);
+        if payment < min_dep {
+            panic!("BelowMinDeposit");
+        }
+        let base_rate: i128 = env.storage().instance().get(&DataKey::BaseRate).unwrap_or(1);
+        if base_rate <= 0 {
+            panic!("InvalidBaseRate");
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&student, &env.current_contract_address(), &payment);
+
+        let duration_secs = (payment / base_rate) as u64;
+        let now = env.ledger().timestamp();
+
+        let mut access: Access = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Access(student.clone(), course_id))
+            .unwrap_or(Access {
+                student: student.clone(),
+                course_id,
+                expiry_time: 0,
+                token: token.clone(),
+                total_watch_time: 0,
+                last_heartbeat: 0,
+                last_purchase_time: now,
+            });
+
+        let base = if access.expiry_time > now {
+            access.expiry_time
+        } else {
+            now
+        };
+        access.expiry_time = base.saturating_add(duration_secs);
+        access.token = token.clone();
+        access.last_purchase_time = now;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Access(student, course_id), &access);
+    }
+
+    #[cfg(test)]
+    pub fn buy_subscription(
+        env: Env,
+        subscriber: Address,
+        course_ids: Vec<u64>,
+        _tier_id: u64,
+        payment: i128,
+        token: Address,
+    ) {
+        subscriber.require_auth();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&subscriber, &env.current_contract_address(), &payment);
+
+        let now = env.ledger().timestamp();
+        let expiry_time = now.saturating_add(30 * 86400);
+
+        let tier = SubscriptionTier {
+            subscriber: subscriber.clone(),
+            expiry_time,
+            course_ids,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscriber), &tier);
+    }
 }
 
 include!("issue_batch.rs");
+
+// Test modules
+#[cfg(test)]
+mod test;
+
+// Performance benchmark tests (Issue #203)
+#[cfg(test)]
+mod perf_bench;
