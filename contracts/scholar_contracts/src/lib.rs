@@ -111,6 +111,7 @@ pub enum Event {
 }
 
 
+/// On-chain record of a student's time-based access to a single course.
 #[contracttype]
 #[derive(Clone)]
 pub struct Access {
@@ -139,6 +140,7 @@ pub struct SponsorProfile {
     pub active_capital: i128,
 }
 
+/// On-chain scholarship account for a student.
 #[contracttype]
 #[derive(Clone)]
 pub struct Scholarship {
@@ -439,6 +441,7 @@ pub struct SlashedStudent {
     pub original_donor: Address,
 }
 
+/// Storage key enumeration for all contract state.
 #[contracttype]
 pub enum DataKey {
     Access(Address, u64),
@@ -559,6 +562,7 @@ pub struct YieldAllocation {
     pub last_updated: u64,
 }
 
+/// A multi-course subscription granting access to a set of courses until expiry.
 #[contracttype]
 #[derive(Clone)]
 pub struct SubscriptionTier {
@@ -583,6 +587,7 @@ pub struct Referendum {
     pub token: Address,
 }
 
+/// Metadata for a registered course.
 #[contracttype]
 #[derive(Clone)]
 pub struct CourseInfo {
@@ -592,6 +597,7 @@ pub struct CourseInfo {
     pub creator: Address,
 }
 
+/// The on-chain course registry holding all registered course IDs.
 #[contracttype]
 #[derive(Clone)]
 pub struct CourseRegistry {
@@ -599,6 +605,7 @@ pub struct CourseRegistry {
     pub last_updated: u64,
 }
 
+/// Royalty split configuration for a course, mapping recipient addresses to percentage shares.
 #[contracttype]
 #[derive(Clone)]
 pub struct RoyaltySplit {
@@ -664,6 +671,7 @@ pub struct StudentPoAState {
     pub stream_halted_until: u64,
 }
 
+/// Daily learning streak data for a student on a specific course.
 #[contracttype]
 #[derive(Clone)]
 pub struct StreakData {
@@ -672,6 +680,7 @@ pub struct StreakData {
     pub total_reward_claimed: i128,
 }
 
+/// A group funding pool that allows multiple students to pool tokens for course access.
 #[contracttype]
 #[derive(Clone)]
 pub struct GroupPool {
@@ -686,6 +695,7 @@ pub struct GroupPool {
     pub created_at: u64,
 }
 
+/// A student's quiz submission proof for a course module.
 #[contracttype]
 #[derive(Clone)]
 pub struct QuizProof {

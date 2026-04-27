@@ -1,0 +1,19 @@
+[package]
+name = "mock-oracle"
+version = "0.1.0"
+edition = "2021"
+description = "Local mock University Oracle CLI for Stream-Scholar testnet development"
+
+[[bin]]
+name = "mock-oracle"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+rand = "0.8.5"
+serde = { version = "1.0.202", features = ["derive"] }
+serde_json = "1.0.117"
+hex = "0.4.3"
+
+[dev-dependencies]
