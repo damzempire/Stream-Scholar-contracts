@@ -273,3 +273,11 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 **Built with ❤️ by the Stream-Scholar Team**
 
 *Transforming education into verifiable digital achievements on the Stellar blockchain.*
+
+## 💰 Bounty Contribution
+
+- **Task:** Veto Powers for Tier-1 Sponsors
+- **Reward:** $1
+- **Source:** GitHub-Paid
+- **Date:** 2026-04-27
+

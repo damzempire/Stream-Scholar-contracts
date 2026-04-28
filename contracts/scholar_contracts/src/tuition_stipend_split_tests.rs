@@ -69,7 +69,7 @@ mod tests {
         client.set_tuition_stipend_split(&admin, &student, &university, &70, &30);
         
         // Fund scholarship (this should trigger the split)
-        client.fund_scholarship(&funder, &student, &1000, &token_contract_id);
+        client.fund_scholarship(&funder, &student, &1000, &token_contract_id, &Symbol::new(&env, "default_roadmap"));
         
         // Check balances - university should have 700, student scholarship should have 300
         let university_balance = token_client.balance(&university);
@@ -117,7 +117,7 @@ mod tests {
         token_client.mint(&funder, &1000);
         
         // Fund scholarship without configuring split
-        client.fund_scholarship(&funder, &student, &1000, &token_contract_id);
+        client.fund_scholarship(&funder, &student, &1000, &token_contract_id, &Symbol::new(&env, "default_roadmap"));
         
         // Student should receive full amount
         let student_scholarship = client.get_scholarship(&student);

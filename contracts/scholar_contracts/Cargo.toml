@@ -11,6 +11,11 @@ doctest = false
 [dependencies]
 expiry_math = { path = "../../crates/expiry_math" }
 soroban-sdk = { workspace = true }
+ark-bn254 = "0.5.0"
+ark-ff = "0.5.0"
+ark-groth16 = "0.5.0"
+ark-relations = "0.5.0"
+ark-serialize = "0.5.0"
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

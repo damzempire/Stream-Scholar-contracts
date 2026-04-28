@@ -1,0 +1,155 @@
+# CI/CD Pipeline for Soroban Wasm Builds (Issue #204)
+# Triggers on every Pull Request and push to main.
+# Enforces: cargo fmt, cargo clippy, cargo test, and wasm size tracking.
+name: Soroban CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    name: Fmt / Clippy / Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Acceptance 1: PRs cannot be merged if formatting fails
+      - name: Check formatting (cargo fmt)
+        run: cargo fmt --all -- --check
+
+      # Acceptance 1: PRs cannot be merged if linting/warnings fail
+      - name: Lint (cargo clippy)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Acceptance 1: PRs cannot be merged if tests fail
+      - name: Run tests (cargo test)
+        run: cargo test --all
+
+  wasm-build:
+    name: Build Wasm & Track Size
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-wasm-
+
+      # Acceptance 3: Compile .wasm artifact and track size
+      - name: Build Wasm release artifact
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Report Wasm size
+        id: wasm_size
+        run: |
+          WASM_FILE=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name "*.wasm" | head -1)
+          if [ -z "$WASM_FILE" ]; then
+            echo "❌ No .wasm file found in release output"
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s "$WASM_FILE")
+          FILE_SIZE_KB=$(awk "BEGIN {printf \"%.2f\", $FILE_SIZE/1024}")
+          LIMIT_BYTES=102400
+          LIMIT_KB=100
+          UTILIZATION=$(awk "BEGIN {printf \"%.1f\", $FILE_SIZE*100/$LIMIT_BYTES}")
+
+          echo "wasm_file=$WASM_FILE"       >> "$GITHUB_OUTPUT"
+          echo "file_size=$FILE_SIZE"       >> "$GITHUB_OUTPUT"
+          echo "file_size_kb=$FILE_SIZE_KB" >> "$GITHUB_OUTPUT"
+          echo "utilization=$UTILIZATION"   >> "$GITHUB_OUTPUT"
+
+          echo "📁 Wasm: $WASM_FILE"
+          echo "📊 Size: $FILE_SIZE bytes ($FILE_SIZE_KB KB) — ${UTILIZATION}% of ${LIMIT_KB}KB limit"
+
+          if [ "$FILE_SIZE" -gt "$LIMIT_BYTES" ]; then
+            echo "❌ Wasm size exceeds ${LIMIT_KB}KB hard limit!"
+            exit 1
+          fi
+          echo "✅ Wasm size is within the ${LIMIT_KB}KB limit."
+
+      # Post size summary to the GitHub Actions job summary
+      - name: Write size summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## 🚀 Wasm Size Report
+
+          | Metric | Value |
+          |--------|-------|
+          | File | \`${{ steps.wasm_size.outputs.wasm_file }}\` |
+          | Size | ${{ steps.wasm_size.outputs.file_size }} bytes (${{ steps.wasm_size.outputs.file_size_kb }} KB) |
+          | Hard Limit | 102400 bytes (100 KB) |
+          | Utilization | ${{ steps.wasm_size.outputs.utilization }}% |
+
+          ### Active Optimizations
+          \`opt-level = "z"\` · \`lto = true\` · \`codegen-units = 1\` · \`strip = "symbols"\` · \`panic = "abort"\`
+          EOF
+
+      # Acceptance 3: Upload .wasm as a build artifact for auditors
+      - name: Upload Wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: soroban-wasm-${{ github.sha }}
+          path: target/wasm32-unknown-unknown/release/*.wasm
+          retention-days: 30
+
+      # Post a PR comment with the wasm size delta (only on pull_request events)
+      - name: Comment Wasm size on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              '## 📦 Wasm Size Report',
+              '',
+              '| Metric | Value |',
+              '|--------|-------|',
+              `| File | \`${{ steps.wasm_size.outputs.wasm_file }}\` |`,
+              `| Size | ${{ steps.wasm_size.outputs.file_size }} bytes (${{ steps.wasm_size.outputs.file_size_kb }} KB) |`,
+              '| Hard Limit | 102400 bytes (100 KB) |',
+              `| Utilization | ${{ steps.wasm_size.outputs.utilization }}% |`,
+              '',
+              '_Generated by the Soroban CI pipeline (Issue #204)_',
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });

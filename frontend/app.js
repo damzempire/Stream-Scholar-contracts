@@ -11,6 +11,7 @@ class StreamScholarNFT {
         this.connectedAccount = null;
         this.studentProfile = null;
         this.nftContract = null;
+        this.currentDonationCourseId = null;
         
         this.initializeEventListeners();
         this.loadSavedProfile();
@@ -366,6 +367,7 @@ class StreamScholarNFT {
                     <div>
                         <h5 class="font-semibold">${course.title}</h5>
                         <p class="text-sm opacity-75">${course.instructor || 'Unknown Instructor'}</p>
+                        ${course.isFree ? '<span class="text-xs px-2 py-1 bg-green-600 rounded-full">Free</span>' : ''}
                     </div>
                     <div class="text-right">
                         <span class="text-xs px-2 py-1 bg-${course.completed ? 'green' : 'blue'}-600 rounded-full">
@@ -388,6 +390,14 @@ class StreamScholarNFT {
                         <p class="text-xs text-green-400">✓ Completed on ${new Date(course.completedAt).toLocaleDateString()}</p>
                     </div>
                 `}
+                ${course.isFree && course.acceptDonations ? `
+                    <div class="mt-3">
+                        <button onclick="streamScholarNFT.showDonationModal(${course.courseId}, '${course.instructor || 'Instructor'}')" 
+                                class="w-full bg-gradient-to-r from-purple-500 to-pink-500 text-white px-3 py-2 rounded-lg text-sm font-medium hover:from-purple-600 hover:to-pink-600 transition-colors">
+                            💝 Tip Instructor
+                        </button>
+                    </div>
+                ` : ''}
             </div>
         `).join('');
     }
@@ -849,7 +859,40 @@ class StudentProfile {
         this.learning = {
             totalXP: data.totalXP || 0,
             level: data.level || 1,
-            courses: data.courses || [],
+            courses: data.courses || [
+                {
+                    courseId: 1,
+                    title: "Introduction to Blockchain",
+                    instructor: "Dr. Sarah Chen",
+                    progress: 75,
+                    completed: false,
+                    isFree: true,
+                    acceptDonations: true,
+                    enrolledAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
+                },
+                {
+                    courseId: 2,
+                    title: "Advanced Stellar Development",
+                    instructor: "Prof. Michael Roberts",
+                    progress: 100,
+                    completed: true,
+                    completedAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
+                    isFree: false,
+                    acceptDonations: false,
+                    xpEarned: 150,
+                    enrolledAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString()
+                },
+                {
+                    courseId: 3,
+                    title: "Smart Contract Security",
+                    instructor: "Dr. Emily Johnson",
+                    progress: 30,
+                    completed: false,
+                    isFree: true,
+                    acceptDonations: true,
+                    enrolledAt: new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString()
+                }
+            ],
             certificates: data.certificates || [],
             skills: data.skills || [],
             studyStreak: data.studyStreak || 0,
@@ -937,6 +980,75 @@ class StudentProfile {
             badges: this.badges,
             recentActivity: this.recentActivity
         };
+    }
+
+    // Donation Stream Functions
+
+    showDonationModal(courseId, instructorName) {
+        if (!this.connectedAccount) {
+            this.showToast('Please connect your wallet first!', 'error');
+            return;
+        }
+
+        this.currentDonationCourseId = courseId;
+        document.getElementById('instructorName').textContent = `Instructor: ${instructorName}`;
+        document.getElementById('donationAmount').value = '';
+        document.getElementById('donationModal').classList.remove('hidden');
+    }
+
+    closeDonationModal() {
+        document.getElementById('donationModal').classList.add('hidden');
+        this.currentDonationCourseId = null;
+    }
+
+    async processDonation() {
+        try {
+            const amount = parseFloat(document.getElementById('donationAmount').value);
+            
+            if (!amount || amount <= 0) {
+                this.showToast('Please enter a valid donation amount', 'error');
+                return;
+            }
+
+            if (!this.connectedAccount) {
+                this.showToast('Wallet not connected', 'error');
+                return;
+            }
+
+            // Convert amount to stroops (1 XLM = 10,000,000 stroops)
+            const amountStroops = Math.floor(amount * 10000000);
+
+            // For demo purposes, simulate the donation transaction
+            // In production, this would call the smart contract's donate_to_instructor function
+            console.log(`Processing donation of ${amount} XLM to course ${this.currentDonationCourseId}`);
+            
+            // Simulate transaction
+            await this.simulateDonationTransaction(amountStroops);
+
+            this.showToast(`Successfully sent ${amount} XLM tip to instructor!`, 'success');
+            this.closeDonationModal();
+
+            // Update the course display to reflect the donation
+            this.updateCoursesList();
+
+        } catch (error) {
+            console.error('Error processing donation:', error);
+            this.showToast('Failed to process donation: ' + error.message, 'error');
+        }
+    }
+
+    async simulateDonationTransaction(amountStroops) {
+        // Simulate blockchain transaction delay
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // In production, this would:
+        // 1. Create a Stellar transaction
+        // 2. Call the donate_to_instructor function on the smart contract
+        // 3. Submit the transaction to the network
+        // 4. Wait for confirmation
+        
+        console.log(`Donation transaction simulated: ${amountStroops} stroops`);
+        return true;
     }
 
     static fromJSON(data) {
