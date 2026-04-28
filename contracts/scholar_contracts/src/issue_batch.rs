@@ -88,12 +88,12 @@ impl ScholarContract {
         let payload_hash_h = env.crypto().sha256(&preimage);
         let payload_bn: BytesN<32> = payload_hash_h.clone().into();
 
-        let mut seq: u64 = env
+        let seq_prev: u64 = env
             .storage()
             .instance()
             .get(&DataKey::ReputationExportSequence)
             .unwrap_or(0);
-        seq += 1;
+        let seq = crate::safe_math::add_u64(&env, seq_prev, 1);
         env.storage()
             .instance()
             .set(&DataKey::ReputationExportSequence, &seq);
@@ -368,9 +368,10 @@ impl ScholarContract {
         env.storage()
             .persistent()
             .set(&DataKey::CommitteeMemberSlot(committee_id, member.clone()), &idx);
-        env.storage()
-            .instance()
-            .set(&DataKey::CommitteeNextMemberIdx(committee_id), &(idx + 1));
+        env.storage().instance().set(
+            &DataKey::CommitteeNextMemberIdx(committee_id),
+            &crate::safe_math::add_u32(&env, idx, 1),
+        );
     }
 
     pub fn mark_committee_sep12_verified(env: Env, admin: Address, member: Address, verified: bool) {

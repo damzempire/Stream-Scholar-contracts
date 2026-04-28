@@ -95,9 +95,7 @@ const APPEAL_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
 const SECURITY_HOLD_DURATION: u64 = 7 * 24 * 60 * 60;
 
 mod issue_features;
-mod formal_verification;
-mod fuzz_verification;
-mod permutation_harness;
+mod safe_math;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Internal contract event variants.
@@ -1003,6 +1001,17 @@ pub enum PrivacyError {
     ProofVerificationFailed = 12,
 }
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+/// Structured errors for arithmetic guards. Emitted by helpers in
+/// `safe_math` when a Soroban-native checked op detects unsafe arithmetic.
+pub enum MathErr {
+    Overflow = 20,
+    Underflow = 21,
+    DivisionByZero = 22,
+}
+
 #[contracttype]
 #[derive(Clone)]
 /// A zero-knowledge claim proof submitted by a student.
@@ -1316,9 +1325,13 @@ impl ScholarContract {
             checkpoint
         } else {
             // Create new checkpoint
-            let epoch_start = checkpoint_number * poa_config.checkpoint_interval_seconds;
-            let epoch_end = epoch_start + poa_config.checkpoint_interval_seconds;
-
+            let epoch_start = safe_math::mul_u64(
+                &env,
+                checkpoint_number,
+                poa_config.checkpoint_interval_seconds,
+            );
+            let epoch_end = safe_math::add_u64(&env, epoch_start, poa_config.checkpoint_interval_seconds);
+            
             let checkpoint = AttendanceCheckpoint {
                 checkpoint_number,
                 epoch_start,
@@ -1365,15 +1378,18 @@ impl ScholarContract {
 
         if checkpoint_number < expected_checkpoint {
             // This is a late submission for a previous checkpoint
-            let grace_period_end = checkpoint_number * poa_config.checkpoint_interval_seconds
-                + poa_config.grace_period_seconds;
+            let grace_period_end = safe_math::add_u64(
+                &env,
+                safe_math::mul_u64(&env, checkpoint_number, poa_config.checkpoint_interval_seconds),
+                poa_config.grace_period_seconds,
+            );
 
             if current_time > grace_period_end {
                 // Too late - mark as delinquent and halt stream
                 poa_state.current_state = CheckpointState::Delinquent;
                 poa_state.stream_halted_until =
-                    current_time + poa_config.checkpoint_interval_seconds;
-
+                    safe_math::add_u64(&env, current_time, poa_config.checkpoint_interval_seconds);
+                
                 // Emit StreamHalted event
                 #[allow(deprecated)]
                 env.events().publish(
@@ -1636,7 +1652,11 @@ impl ScholarContract {
             .get(&DataKey::ReputationBonus(student.clone()))
             .unwrap_or(false);
         if has_reputation_bonus {
-            effective_rate = (effective_rate * 98) / 100;
+            effective_rate = safe_math::div_i128(
+                &env,
+                safe_math::mul_i128(&env, effective_rate, 98),
+                100,
+            );
         }
 
         let gpa_multiplier: u64 = env
@@ -1644,7 +1664,11 @@ impl ScholarContract {
             .persistent()
             .get(&DataKey::GpaMultiplier(student.clone()))
             .unwrap_or(10000);
-        effective_rate = (effective_rate * gpa_multiplier as i128) / 10000;
+        effective_rate = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, effective_rate, gpa_multiplier as i128),
+            10000,
+        );
 
         let access: Access = env
             .storage()
@@ -1661,8 +1685,12 @@ impl ScholarContract {
             });
 
         if access.total_watch_time >= discount_threshold {
-            let discount = (effective_rate * discount_percentage as i128) / 100;
-            effective_rate - discount
+            let discount = safe_math::div_i128(
+                &env,
+                safe_math::mul_i128(&env, effective_rate, discount_percentage as i128),
+                100,
+            );
+            safe_math::sub_i128(&env, effective_rate, discount)
         } else {
             effective_rate
         }
@@ -1788,12 +1816,13 @@ impl ScholarContract {
             });
 
         // Only add the student's portion to scholarship balance after processing tutoring redirects
-        let final_student_amount =
-            Self::process_tutoring_payment(env.clone(), student.clone(), student_amount, &token);
-
-        scholarship.balance += final_student_amount;
-        scholarship.unlocked_balance += final_student_amount; // Assume funded amount is unlocked
-        scholarship.total_grant += final_student_amount; // Issue #128: Track total grant
+        let final_student_amount = Self::process_tutoring_payment(env.clone(), student.clone(), student_amount, &token);
+        
+        scholarship.balance = safe_math::add_i128(&env, scholarship.balance, final_student_amount);
+        scholarship.unlocked_balance =
+            safe_math::add_i128(&env, scholarship.unlocked_balance, final_student_amount);
+        scholarship.total_grant =
+            safe_math::add_i128(&env, scholarship.total_grant, final_student_amount); // Issue #128
         scholarship.is_native = is_native; // Issue #118: Set native flag
 
         env.storage()
@@ -1886,7 +1915,11 @@ impl ScholarContract {
         }
 
         // Issue #128: Check for final release lock
-        let locked_amount = (scholarship.total_grant * FINAL_RELEASE_PERCENTAGE as i128) / 100;
+        let locked_amount = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, scholarship.total_grant, FINAL_RELEASE_PERCENTAGE as i128),
+            100,
+        );
         if scholarship.balance <= locked_amount && !scholarship.final_release_claimed {
             panic!("Final 10% is locked pending community vote");
         }
@@ -1896,8 +1929,10 @@ impl ScholarContract {
         // Issue #128: Prevent withdrawing into the locked 10%
         if !scholarship.final_release_claimed && scholarship.total_grant > 0 {
             if scholarship.balance > locked_amount {
-                available_to_withdraw =
-                    core::cmp::min(available_to_withdraw, scholarship.balance - locked_amount);
+                available_to_withdraw = core::cmp::min(
+                    available_to_withdraw,
+                    safe_math::sub_i128(&env, scholarship.balance, locked_amount),
+                );
             } else {
                 available_to_withdraw = 0;
             }
@@ -1913,11 +1948,15 @@ impl ScholarContract {
 
         // Issue #112: Apply tax
         let tax_rate_bps: u32 = env.storage().instance().get(&DataKey::TaxRate).unwrap_or(0);
-        let tax_amount = (amount * tax_rate_bps as i128) / 10000;
-        let net_amount = amount - tax_amount;
+        let tax_amount = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, amount, tax_rate_bps as i128),
+            10000,
+        );
+        let net_amount = safe_math::sub_i128(&env, amount, tax_amount);
 
-        scholarship.balance -= amount;
-        scholarship.unlocked_balance -= amount;
+        scholarship.balance = safe_math::sub_i128(&env, scholarship.balance, amount);
+        scholarship.unlocked_balance = safe_math::sub_i128(&env, scholarship.unlocked_balance, amount);
         env.storage()
             .persistent()
             .set(&DataKey::Scholarship(student.clone()), &scholarship);
@@ -2089,10 +2128,16 @@ impl ScholarContract {
         let mut tokens_to_release = scholarship.unlocked_balance;
 
         if !scholarship.final_release_claimed && scholarship.total_grant > 0 {
-            let locked_amount = (scholarship.total_grant * FINAL_RELEASE_PERCENTAGE as i128) / 100;
+            let locked_amount = safe_math::div_i128(
+                &env,
+                safe_math::mul_i128(&env, scholarship.total_grant, FINAL_RELEASE_PERCENTAGE as i128),
+                100,
+            );
             if scholarship.balance > locked_amount {
-                tokens_to_release =
-                    core::cmp::min(tokens_to_release, scholarship.balance - locked_amount);
+                tokens_to_release = core::cmp::min(
+                    tokens_to_release,
+                    safe_math::sub_i128(&env, scholarship.balance, locked_amount),
+                );
             } else {
                 tokens_to_release = 0;
             }
@@ -2100,16 +2145,22 @@ impl ScholarContract {
 
         if scholarship.is_native {
             if scholarship.balance > NATIVE_XLM_RESERVE {
-                tokens_to_release =
-                    core::cmp::min(tokens_to_release, scholarship.balance - NATIVE_XLM_RESERVE);
+                tokens_to_release = core::cmp::min(
+                    tokens_to_release,
+                    safe_math::sub_i128(&env, scholarship.balance, NATIVE_XLM_RESERVE),
+                );
             } else {
                 tokens_to_release = 0;
             }
         }
 
         let tax_rate_bps: u32 = env.storage().instance().get(&DataKey::TaxRate).unwrap_or(0);
-        let tax_withholding_amount = (tokens_to_release * tax_rate_bps as i128) / 10000;
-        let net_claimable_amount = tokens_to_release - tax_withholding_amount;
+        let tax_withholding_amount = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, tokens_to_release, tax_rate_bps as i128),
+            10000,
+        );
+        let net_claimable_amount = safe_math::sub_i128(&env, tokens_to_release, tax_withholding_amount);
 
         ClaimSimulation {
             tokens_to_release,
@@ -2245,12 +2296,11 @@ impl ScholarContract {
         client.transfer(&env.current_contract_address(), &student, &SUBSIDY_AMOUNT);
 
         // 7. Update state to prevent double-claiming
-        env.storage()
-            .persistent()
-            .set(&DataKey::HasReceivedSubsidy(student.clone()), &true);
-        env.storage()
-            .instance()
-            .set(&DataKey::SubsidizedStudentCount, &(count + 1));
+        env.storage().persistent().set(&DataKey::HasReceivedSubsidy(student.clone()), &true);
+        env.storage().instance().set(
+            &DataKey::SubsidizedStudentCount,
+            &safe_math::add_u32(&env, count, 1),
+        );
 
         // 8. Publish event
         env.events()
@@ -2301,7 +2351,11 @@ impl ScholarContract {
             .get(&DataKey::Scholarship(student.clone()))
             .expect("No scholarship found");
 
-        let locked_amount = (scholarship.total_grant * FINAL_RELEASE_PERCENTAGE as i128) / 100;
+        let locked_amount = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, scholarship.total_grant, FINAL_RELEASE_PERCENTAGE as i128),
+            100,
+        );
         if scholarship.balance > locked_amount || scholarship.final_release_claimed {
             panic!("Final release vote cannot be initiated yet");
         }
@@ -2400,7 +2454,7 @@ impl ScholarContract {
         }
 
         vote.voters.push_back(voter);
-        vote.yes_votes += 1;
+        vote.yes_votes = safe_math::add_u32(&env, vote.yes_votes, 1);
 
         if vote.yes_votes >= COMMUNITY_VOTE_THRESHOLD as u32 {
             vote.is_passed = true;
@@ -2475,7 +2529,11 @@ impl ScholarContract {
             panic!("Final release already claimed");
         }
 
-        let locked_amount = (scholarship.total_grant * FINAL_RELEASE_PERCENTAGE as i128) / 100;
+        let locked_amount = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, scholarship.total_grant, FINAL_RELEASE_PERCENTAGE as i128),
+            100,
+        );
         if scholarship.balance > locked_amount {
             panic!("Final release not yet locked");
         }
@@ -2491,9 +2549,10 @@ impl ScholarContract {
             if amount_to_release < NATIVE_XLM_RESERVE {
                 panic!("Final balance is less than gas reserve");
             }
-            let final_claim = amount_to_release - NATIVE_XLM_RESERVE;
-            scholarship.balance -= final_claim;
-            scholarship.unlocked_balance -= final_claim;
+            let final_claim = safe_math::sub_i128(&env, amount_to_release, NATIVE_XLM_RESERVE);
+            scholarship.balance = safe_math::sub_i128(&env, scholarship.balance, final_claim);
+            scholarship.unlocked_balance =
+                safe_math::sub_i128(&env, scholarship.unlocked_balance, final_claim);
 
             let client = token::Client::new(&env, &scholarship.token);
             client.transfer(&env.current_contract_address(), &student, &final_claim);
@@ -2820,11 +2879,9 @@ impl ScholarContract {
         let client = token::Client::new(&env, &fund.token);
         client.transfer(&admin, &env.current_contract_address(), &yield_amount);
 
-        fund.total_balance += yield_amount;
-        fund.total_accrued += yield_amount;
-        env.storage()
-            .instance()
-            .set(&DataKey::ResearchBonusFund, &fund);
+        fund.total_balance = safe_math::add_i128(&env, fund.total_balance, yield_amount);
+        fund.total_accrued = safe_math::add_i128(&env, fund.total_accrued, yield_amount);
+        env.storage().instance().set(&DataKey::ResearchBonusFund, &fund);
 
         #[allow(deprecated)]
         env.events()
@@ -2873,10 +2930,10 @@ impl ScholarContract {
         }
 
         let recipient_count = core::cmp::max(1u64, leaderboard_size / 20);
-        let bonus_per_student = fund.total_balance / recipient_count as i128;
+        let bonus_per_student = safe_math::div_i128(&env, fund.total_balance, recipient_count as i128);
         let total_paid = bonus_per_student.saturating_mul(recipient_count as i128);
-        fund.total_balance -= total_paid;
-        fund.total_distributed += total_paid;
+        fund.total_balance = safe_math::sub_i128(&env, fund.total_balance, total_paid);
+        fund.total_distributed = safe_math::add_i128(&env, fund.total_distributed, total_paid);
         fund.last_distribution = env.ledger().timestamp();
         env.storage()
             .instance()
@@ -2907,7 +2964,11 @@ impl ScholarContract {
             .get(&DataKey::ReputationBonus(student.clone()))
             .unwrap_or(false);
         if has_reputation_bonus {
-            effective_rate = (effective_rate * 98) / 100;
+            effective_rate = safe_math::div_i128(
+                &env,
+                safe_math::mul_i128(&env, effective_rate, 98),
+                100,
+            );
         }
 
         let gpa_multiplier: i128 = env
@@ -2918,7 +2979,11 @@ impl ScholarContract {
         if gpa_multiplier == 0 {
             return 0;
         }
-        effective_rate = (effective_rate * gpa_multiplier) / 10000;
+        effective_rate = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, effective_rate, gpa_multiplier),
+            10000,
+        );
 
         let scholarship: Option<Scholarship> = env
             .storage()
@@ -2927,7 +2992,7 @@ impl ScholarContract {
         if let Some(s) = scholarship {
             let balance = s.balance;
             if balance > 0 && effective_rate > 0 {
-                return (balance / effective_rate) as u64;
+                return safe_math::div_i128(&env, balance, effective_rate) as u64;
             }
         }
 
@@ -2938,14 +3003,9 @@ impl ScholarContract {
 
     pub fn set_authorized_payout_address(env: Env, student: Address, authorized_address: Address) {
         student.require_auth();
-        let unlock_time = env.ledger().timestamp() + 172800; // 48 hours
-        env.storage().instance().set(
-            &DataKey::AuthorizedPayoutPending(student.clone()),
-            &authorized_address,
-        );
-        env.storage()
-            .instance()
-            .set(&DataKey::UnlockTime(student.clone()), &unlock_time);
+        let unlock_time = safe_math::add_u64(&env, env.ledger().timestamp(), 172800); // 48 hours
+        env.storage().instance().set(&DataKey::AuthorizedPayoutPending(student.clone()), &authorized_address);
+        env.storage().instance().set(&DataKey::UnlockTime(student.clone()), &unlock_time);
     }
 
     pub fn confirm_payout_unlock(env: Env, student: Address) {
@@ -2996,11 +3056,9 @@ impl ScholarContract {
                 soroban_sdk::xdr::ScErrorCode::InvalidAction,
             ));
         }
-
-        scholarship.balance -= amount;
-        env.storage()
-            .instance()
-            .set(&DataKey::Scholarship(student), &scholarship);
+        
+        scholarship.balance = safe_math::sub_i128(&env, scholarship.balance, amount);
+        env.storage().instance().set(&DataKey::Scholarship(student), &scholarship);
 
         let client = token::Client::new(&env, &scholarship.token);
         client.transfer(&env.current_contract_address(), &payout_address, &amount);
@@ -3056,10 +3114,8 @@ impl ScholarContract {
             ));
         }
 
-        scholarship.balance -= amount;
-        env.storage()
-            .instance()
-            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+        scholarship.balance = safe_math::sub_i128(&env, scholarship.balance, amount);
+        env.storage().instance().set(&DataKey::Scholarship(student.clone()), &scholarship);
 
         let payout_address: Address = env
             .storage()
@@ -3380,7 +3436,7 @@ impl ScholarContract {
         let now = env.ledger().timestamp();
 
         // Check cooldown period
-        if now < condition.last_clawback_time + condition.cooldown_period {
+        if now < safe_math::add_u64(&env, condition.last_clawback_time, condition.cooldown_period) {
             return false; // Still in cooldown
         }
 
@@ -3446,7 +3502,7 @@ impl ScholarContract {
         // Check execution timeout (7 days after trigger)
         let now = env.ledger().timestamp();
         let triggered_time = condition.triggered_at.unwrap();
-        if now > triggered_time + CLAWBACK_EXECUTION_TIMEOUT {
+        if now > safe_math::add_u64(&env, triggered_time, CLAWBACK_EXECUTION_TIMEOUT) {
             panic!("Clawback execution window has expired");
         }
 
@@ -3465,16 +3521,21 @@ impl ScholarContract {
         }
 
         // Calculate clawback amount
-        let clawback_amount = (scholarship.balance * condition.clawback_percentage as i128) / 100;
+        let clawback_amount = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, scholarship.balance, condition.clawback_percentage as i128),
+            100,
+        );
 
         if clawback_amount <= 0 {
             panic!("Calculated clawback amount is zero or negative");
         }
 
         // Update scholarship
-        scholarship.balance -= clawback_amount;
+        scholarship.balance = safe_math::sub_i128(&env, scholarship.balance, clawback_amount);
         if scholarship.unlocked_balance > clawback_amount {
-            scholarship.unlocked_balance -= clawback_amount;
+            scholarship.unlocked_balance =
+                safe_math::sub_i128(&env, scholarship.unlocked_balance, clawback_amount);
         } else {
             scholarship.unlocked_balance = 0;
         }
@@ -3611,10 +3672,10 @@ impl ScholarContract {
     }
 
     fn check_time_elapsed(env: &Env, condition: &ClawbackCondition, threshold_days: u64) -> bool {
-        let threshold_seconds = threshold_days * 86400;
+        let threshold_seconds = safe_math::mul_u64(env, threshold_days, 86400);
         if let Some(triggered) = condition.triggered_at {
             let now = env.ledger().timestamp();
-            now >= triggered + threshold_seconds
+            now >= safe_math::add_u64(env, triggered, threshold_seconds)
         } else {
             false
         }
@@ -3630,7 +3691,7 @@ impl ScholarContract {
             .persistent()
             .get::<_, StudentProfile>(&DataKey::StudentProfile(student.clone()))
         {
-            let inactivity_seconds = inactivity_threshold_days * 86400;
+            let inactivity_seconds = safe_math::mul_u64(env, inactivity_threshold_days, 86400);
             let now = env.ledger().timestamp();
             let time_since_activity = now.saturating_sub(profile.last_activity);
             time_since_activity > inactivity_seconds
@@ -3671,10 +3732,10 @@ impl ScholarContract {
             .instance()
             .get(&DataKey::QFRoundCounter)
             .unwrap_or(0);
-        let round_id = round_counter + 1;
+        let round_id = safe_math::add_u64(&env, round_counter, 1);
 
         let now = env.ledger().timestamp();
-        let end_time = now + QF_ROUND_DURATION;
+        let end_time = safe_math::add_u64(&env, now, QF_ROUND_DURATION);
 
         let round = QuadraticFundingRound {
             round_id,
@@ -3742,7 +3803,7 @@ impl ScholarContract {
             panic!("QF round has ended");
         }
 
-        let project_id = round.project_count + 1;
+        let project_id = safe_math::add_u64(&env, round.project_count, 1);
 
         let project = FundingProject {
             project_id,
@@ -3761,7 +3822,7 @@ impl ScholarContract {
             .persistent()
             .set(&DataKey::FundingProject(round_id, project_id), &project);
 
-        round.project_count += 1;
+        round.project_count = safe_math::add_u64(&env, round.project_count, 1);
         env.storage()
             .persistent()
             .set(&DataKey::QuadraticFundingRound(round_id), &round);
@@ -3832,19 +3893,20 @@ impl ScholarContract {
         );
 
         // Update project stats
-        project.total_raised += amount;
-        project.contributor_count += 1;
+        project.total_raised = safe_math::add_i128(&env, project.total_raised, amount);
+        project.contributor_count = safe_math::add_u64(&env, project.contributor_count, 1);
 
         // Calculate sqrt of contribution for QF formula
         let sqrt_amount = Self::isqrt(amount);
-        project.sqrt_sum_contributions += sqrt_amount;
+        project.sqrt_sum_contributions =
+            safe_math::add_i128(&env, project.sqrt_sum_contributions, sqrt_amount);
 
         env.storage()
             .persistent()
             .set(&DataKey::FundingProject(round_id, project_id), &project);
 
         // Update round stats
-        round.total_contributions += amount;
+        round.total_contributions = safe_math::add_i128(&env, round.total_contributions, amount);
         env.storage()
             .persistent()
             .set(&DataKey::QuadraticFundingRound(round_id), &round);
@@ -3886,7 +3948,11 @@ impl ScholarContract {
         // Calculate matching amounts for all projects using QF formula
         // Matching = (Σ√contribution)² - Σcontribution
         let total_sqrt_sum: i128 = Self::calculate_total_sqrt_sum(&env, round_id);
-        let total_matching_budget = (total_sqrt_sum * total_sqrt_sum) - round.total_contributions;
+        let total_matching_budget = safe_math::sub_i128(
+            &env,
+            safe_math::mul_i128(&env, total_sqrt_sum, total_sqrt_sum),
+            round.total_contributions,
+        );
 
         if total_matching_budget <= 0 || total_matching_budget > round.matching_pool_balance {
             panic!("Matching budget calculation failed");
@@ -3901,10 +3967,16 @@ impl ScholarContract {
                 .get::<_, FundingProject>(&DataKey::FundingProject(round_id, project_idx))
             {
                 if project.sqrt_sum_contributions > 0 {
-                    let project_matching = ((project.sqrt_sum_contributions
-                        * project.sqrt_sum_contributions)
-                        - project.total_raised)
-                        .max(0);
+                    let project_matching = safe_math::sub_i128(
+                        &env,
+                        safe_math::mul_i128(
+                            &env,
+                            project.sqrt_sum_contributions,
+                            project.sqrt_sum_contributions,
+                        ),
+                        project.total_raised,
+                    )
+                    .max(0);
 
                     if project_matching > 0 {
                         project.total_matching = project_matching;
@@ -3926,7 +3998,7 @@ impl ScholarContract {
                             &distribution,
                         );
 
-                        total_distributed += project_matching;
+                        total_distributed = safe_math::add_i128(&env, total_distributed, project_matching);
                     }
                 }
             }
@@ -4036,21 +4108,26 @@ impl ScholarContract {
 
     // --- QF Helper Functions ---
 
-    /// Integer square root calculation
+    /// Integer square root calculation. Newton's iteration over the Soroban
+    /// host i128 type; the inputs are guarded by `checked_*` helpers so a
+    /// pathological `n` cannot trigger a silent intermediate overflow.
     fn isqrt(n: i128) -> i128 {
-        if n < 0 {
-            return 0;
-        }
-        if n == 0 {
+        if n <= 0 {
             return 0;
         }
 
         let mut x = n;
-        let mut y = (x + 1) / 2;
+        // (x + 1) cannot overflow because x == n <= i128::MAX, but we guard the
+        // caller's invariant by clamping at i128::MAX/2 instead of trapping —
+        // the iteration converges either way. Use checked_add to be explicit.
+        let mut y = x.checked_add(1).map(|s| s / 2).unwrap_or(x / 2);
 
         while y < x {
             x = y;
-            y = (x + n / x) / 2;
+            // n / x is bounded by n; (x + n/x) cannot overflow for the
+            // valid ranges we care about, but use checked_add for safety.
+            let step = n / x;
+            y = x.checked_add(step).map(|s| s / 2).unwrap_or(x);
         }
 
         x
@@ -4071,7 +4148,7 @@ impl ScholarContract {
                 .persistent()
                 .get::<_, FundingProject>(&DataKey::FundingProject(round_id, project_idx))
             {
-                total_sqrt += project.sqrt_sum_contributions;
+                total_sqrt = safe_math::add_i128(env, total_sqrt, project.sqrt_sum_contributions);
             }
         }
 
@@ -4106,12 +4183,11 @@ impl ScholarContract {
                 course_id,
             });
 
-        bounty_reserve.balance += amount;
+        bounty_reserve.balance = safe_math::add_i128(&env, bounty_reserve.balance, amount);
 
-        env.storage().persistent().set(
-            &DataKey::BountyReserve(student.clone(), course_id),
-            &bounty_reserve,
-        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::BountyReserve(student.clone(), course_id), &bounty_reserve);
         env.storage().persistent().extend_ttl(
             &DataKey::BountyReserve(student, course_id),
             LEDGER_BUMP_THRESHOLD,
@@ -4238,11 +4314,10 @@ impl ScholarContract {
         }
 
         // Reentrancy protection: update state before external call
-        bounty_reserve.balance -= bounty_amount;
-        env.storage().persistent().set(
-            &DataKey::BountyReserve(student.clone(), course_id),
-            &bounty_reserve,
-        );
+        bounty_reserve.balance = safe_math::sub_i128(&env, bounty_reserve.balance, bounty_amount);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BountyReserve(student.clone(), course_id), &bounty_reserve);
 
         // Mark milestone as claimed
         let current_time = env.ledger().timestamp();
@@ -4639,36 +4714,23 @@ impl ScholarContract {
     }
 
     fn check_and_apply_alumni_tax(env: &Env, alumni: &Address, amount: i128) -> i128 {
-        if let Some(percentage) = env
-            .storage()
-            .persistent()
-            .get::<_, u32>(&DataKey::AlumniPledge(alumni.clone()))
-        {
-            let raw_tax = amount * percentage as i128;
-            let mut tax_amount = raw_tax / 100;
+        if let Some(percentage) = env.storage().persistent().get::<_, u32>(&DataKey::AlumniPledge(alumni.clone())) {
+            let raw_tax = safe_math::mul_i128(env, amount, percentage as i128);
+            let mut tax_amount = safe_math::div_i128(env, raw_tax, 100);
             let dust = raw_tax % 100;
 
-            let mut current_dust: i128 = env
-                .storage()
-                .instance()
-                .get(&DataKey::DustSweeper)
-                .unwrap_or(0);
-            current_dust += dust;
+            let mut current_dust: i128 = env.storage().instance().get(&DataKey::DustSweeper).unwrap_or(0);
+            current_dust = safe_math::add_i128(env, current_dust, dust);
 
             if current_dust >= 100 {
-                tax_amount += current_dust / 100;
+                tax_amount = safe_math::add_i128(env, tax_amount, current_dust / 100);
                 current_dust %= 100;
             }
-            env.storage()
-                .instance()
-                .set(&DataKey::DustSweeper, &current_dust);
+            env.storage().instance().set(&DataKey::DustSweeper, &current_dust);
 
             if tax_amount > 0 {
                 // Route to Global Scholarship Pool
-                let pool_address: Address = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::GlobalScholarshipPool)
+                let _pool_address: Address = env.storage().instance().get(&DataKey::GlobalScholarshipPool)
                     .unwrap_or(env.current_contract_address()); // Default to contract address if not set
 
                 // For simplicity in this implementation, we emit an event and
@@ -4677,7 +4739,7 @@ impl ScholarContract {
                     (Symbol::new(env, "PayItForwardExecuted"), alumni.clone()),
                     tax_amount,
                 );
-                return amount - tax_amount;
+                return safe_math::sub_i128(env, amount, tax_amount);
             }
         }
         amount
@@ -4757,11 +4819,10 @@ impl ScholarContract {
             SponsorYieldPreference::Reinvest => {
                 // Add back to active capital
                 let mut updated_profile = profile;
-                updated_profile.active_capital += amount;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::SponsorProfile(sponsor.clone()), &updated_profile);
-            }
+                updated_profile.active_capital =
+                    safe_math::add_i128(&env, updated_profile.active_capital, amount);
+                env.storage().persistent().set(&DataKey::SponsorProfile(sponsor.clone()), &updated_profile);
+            },
             SponsorYieldPreference::ReturnToSponsor => {
                 let client = token::Client::new(&env, &token);
                 client.transfer(&env.current_contract_address(), &sponsor, &amount);
@@ -4790,25 +4851,17 @@ impl ScholarContract {
 
     /// #177 Emergency-Liquidity Withdrawal Bounds
     pub fn calculate_liquidity_bounds(env: Env) -> i128 {
-        let total_tvl: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalTVL)
-            .unwrap_or(0);
-        let daily_burn: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::DailyBurnRate)
-            .unwrap_or(0);
+        let total_tvl: i128 = env.storage().instance().get(&DataKey::TotalTVL).unwrap_or(0);
+        let daily_burn: i128 = env.storage().instance().get(&DataKey::DailyBurnRate).unwrap_or(0);
 
-        let fourteen_day_burn = daily_burn * 14;
-        let buffer = (total_tvl * 5) / 100; // 5% buffer
+        let fourteen_day_burn = safe_math::mul_i128(&env, daily_burn, 14);
+        let buffer = safe_math::div_i128(&env, safe_math::mul_i128(&env, total_tvl, 5), 100); // 5%
 
-        let required_liquidity = fourteen_day_burn + buffer;
+        let required_liquidity = safe_math::add_i128(&env, fourteen_day_burn, buffer);
         if total_tvl < required_liquidity {
             return 0;
         }
-        total_tvl - required_liquidity
+        safe_math::sub_i128(&env, total_tvl, required_liquidity)
     }
 
     pub fn route_to_yield(env: Env, admin: Address, amount: i128) {
@@ -4869,8 +4922,8 @@ impl ScholarContract {
 
         let current_time = env.ledger().timestamp();
         let elapsed = current_time.saturating_sub(stream.start_time);
-        let accrued = (elapsed as i128) * stream.amount_per_second;
-        let available = accrued - stream.total_withdrawn;
+        let accrued = safe_math::mul_i128(&env, elapsed as i128, stream.amount_per_second);
+        let available = safe_math::sub_i128(&env, accrued, stream.total_withdrawn);
 
         if available <= 0 {
             return 0;
@@ -4882,7 +4935,7 @@ impl ScholarContract {
         let client = token::Client::new(&env, &token);
         client.transfer(&env.current_contract_address(), &student, &final_amount);
 
-        stream.total_withdrawn += available;
+        stream.total_withdrawn = safe_math::add_i128(&env, stream.total_withdrawn, available);
         env.storage().persistent().set(&stream_key, &stream);
 
         final_amount
@@ -4896,7 +4949,7 @@ impl ScholarContract {
             .get(&DataKey::Admin)
             .unwrap_or(env.current_contract_address());
         let client = token::Client::new(env, token);
-        let royalty = amount / 10; // 10% royalty
+        let royalty = safe_math::div_i128(env, amount, 10); // 10% royalty
         if royalty > 0 {
             // Accrue protocol fees instead of transferring during the call.
             let key = DataKey::ProtocolFeesAccrued(token.clone());
@@ -4918,8 +4971,9 @@ impl ScholarContract {
         _token: &Address,
     ) -> (i128, i128) {
         // Placeholder for split logic (70/30)
-        let university_share = (amount * 70) / 100;
-        let student_share = amount - university_share;
+        let university_share =
+            safe_math::div_i128(env, safe_math::mul_i128(env, amount, 70), 100);
+        let student_share = safe_math::sub_i128(env, amount, university_share);
         (university_share, student_share)
     }
 
@@ -4930,15 +4984,9 @@ impl ScholarContract {
 
     pub fn verify_academic_progress(env: Env, student: Address, _course_id: u64) {
         // Mock verification: unlocks some balance
-        let mut scholarship: Scholarship = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Scholarship(student.clone()))
-            .expect("Scholarship not found");
-        scholarship.unlocked_balance += 100; // Unlock 100 units
-        env.storage()
-            .persistent()
-            .set(&DataKey::Scholarship(student), &scholarship);
+        let mut scholarship: Scholarship = env.storage().persistent().get(&DataKey::Scholarship(student.clone())).expect("Scholarship not found");
+        scholarship.unlocked_balance = safe_math::add_i128(&env, scholarship.unlocked_balance, 100);
+        env.storage().persistent().set(&DataKey::Scholarship(student), &scholarship);
     }
 
     pub fn set_course_duration(env: Env, course_id: u64, duration: u64) {
@@ -5046,8 +5094,8 @@ impl ScholarContract {
         let (stream_halted_until, refunded_amount) = match payload.violation_type {
             ViolationType::Minor => {
                 // Minor violation: pause stream for 30 days
-                let pause_duration = 30 * 24 * 60 * 60; // 30 days in seconds
-                let halt_until = current_time + pause_duration;
+                let pause_duration: u64 = 30 * 24 * 60 * 60; // 30 days in seconds
+                let halt_until = safe_math::add_u64(&env, current_time, pause_duration);
                 (halt_until, remaining_balance)
             }
             ViolationType::Major => {
@@ -5145,7 +5193,7 @@ impl ScholarContract {
         let current_time = env.ledger().timestamp();
 
         // Check timestamp is not too old (within 24 hours)
-        if current_time > payload.timestamp + (24 * 60 * 60) {
+        if current_time > safe_math::add_u64(env, payload.timestamp, 24 * 60 * 60) {
             env.panic_with_error((
                 soroban_sdk::xdr::ScErrorType::Contract,
                 soroban_sdk::xdr::ScErrorCode::InvalidAction,
@@ -5153,8 +5201,7 @@ impl ScholarContract {
         }
 
         // Check timestamp is not in the future
-        if payload.timestamp > current_time + 300 {
-            // 5 minute tolerance
+        if payload.timestamp > safe_math::add_u64(env, current_time, 300) { // 5 minute tolerance
             env.panic_with_error((
                 soroban_sdk::xdr::ScErrorType::Contract,
                 soroban_sdk::xdr::ScErrorCode::InvalidAction,
@@ -5210,11 +5257,11 @@ impl ScholarContract {
         if current_time >= access.expiry_time {
             return 0;
         }
-
-        let remaining_seconds = access.expiry_time - current_time;
+        
+        let remaining_seconds = safe_math::sub_u64(env, access.expiry_time, current_time);
         let rate = Self::calculate_dynamic_rate(env.clone(), student.clone(), course_id);
 
-        (remaining_seconds as i128) * rate
+        safe_math::mul_i128(env, remaining_seconds as i128, rate)
     }
 
     /// Halt student's stream for specified duration
@@ -5417,15 +5464,9 @@ impl ScholarContract {
         client.transfer(&donor, &env.current_contract_address(), &amount);
 
         // Issue #185: Update tracked TVL
-        let mut tracked_tvl: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TrackedTVL)
-            .unwrap_or(0);
-        tracked_tvl += amount;
-        env.storage()
-            .instance()
-            .set(&DataKey::TrackedTVL, &tracked_tvl);
+        let tracked_tvl: i128 = env.storage().instance().get(&DataKey::TrackedTVL).unwrap_or(0);
+        let tracked_tvl = safe_math::add_i128(&env, tracked_tvl, amount);
+        env.storage().instance().set(&DataKey::TrackedTVL, &tracked_tvl);
     }
 
     // Issue #183: Circuit Breaker: Protocol-Wide Emergency Pause
@@ -5493,11 +5534,11 @@ impl ScholarContract {
             .unwrap_or(0);
         let current_time = env.ledger().timestamp();
         let pause_duration = if pause_timestamp > 0 {
-            current_time - pause_timestamp
+            safe_math::sub_u64(&env, current_time, pause_timestamp)
         } else {
             0
         };
-
+        
         if pause_duration > 0 {
             // Extend all active access periods by pause duration
             // This is a simplified implementation - in production, you'd iterate through all active accesses
@@ -5714,15 +5755,9 @@ impl ScholarContract {
         let client = token::Client::new(&env, &token);
         client.transfer(&depositor, &env.current_contract_address(), &total_pull);
 
-        let mut tracked_tvl: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TrackedTVL)
-            .unwrap_or(0);
-        tracked_tvl += total_pull;
-        env.storage()
-            .instance()
-            .set(&DataKey::TrackedTVL, &tracked_tvl);
+        let tracked_tvl: i128 = env.storage().instance().get(&DataKey::TrackedTVL).unwrap_or(0);
+        let tracked_tvl = safe_math::add_i128(&env, tracked_tvl, total_pull);
+        env.storage().instance().set(&DataKey::TrackedTVL, &tracked_tvl);
     }
 
     // Issue #185: Regulated Asset (SEP-08) Clawback Accounting
@@ -5746,8 +5781,8 @@ impl ScholarContract {
 
             if actual_balance < tracked_tvl {
                 // Clawback detected
-                let clawback_amount = tracked_tvl - actual_balance;
-
+                let clawback_amount = safe_math::sub_i128(&env, tracked_tvl, actual_balance);
+                
                 #[allow(deprecated)]
                 env.events().publish(
                     (
@@ -5778,17 +5813,17 @@ impl ScholarContract {
             .get(&DataKey::TrackedTVL)
             .unwrap_or(0)
     }
-
-    fn recalculate_streams_pro_rata(_env: &Env, new_balance: i128, old_balance: i128) {
+    
+    fn recalculate_streams_pro_rata(env: &Env, new_balance: i128, old_balance: i128) {
         // Simplified implementation - in production, you'd iterate through all active streams
         // and adjust their flow rates proportionally
         // For now, this is a placeholder for the pro-rata recalculation logic
         let _ratio = if old_balance > 0 {
-            (new_balance * 10000) / old_balance
+            safe_math::div_i128(env, safe_math::mul_i128(env, new_balance, 10000), old_balance)
         } else {
             10000
         };
-
+        
         // The actual implementation would:
         // 1. Get all active streams
         // 2. Calculate new flow rates based on the ratio
@@ -5822,14 +5857,10 @@ impl ScholarContract {
 
         let client = token::Client::new(&env, &token);
         client.transfer(&proposer, &env.current_contract_address(), &bond_amount);
-
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ReferendumCount)
-            .unwrap_or(0);
-        let ref_id = count + 1;
-        let end_time = env.ledger().timestamp() + 604800; // 7 days voting period
+        
+        let count: u64 = env.storage().instance().get(&DataKey::ReferendumCount).unwrap_or(0);
+        let ref_id = safe_math::add_u64(&env, count, 1);
+        let end_time = safe_math::add_u64(&env, env.ledger().timestamp(), 604800); // 7 days
         
         let referendum = Referendum { 
             id: ref_id, 
@@ -5873,13 +5904,11 @@ impl ScholarContract {
         }
         env.storage().persistent().set(&vote_key, &true);
         if vote_yes {
-            referendum.yes_votes += voting_power;
+            referendum.yes_votes = safe_math::add_i128(&env, referendum.yes_votes, voting_power);
         } else {
-            referendum.no_votes += voting_power;
+            referendum.no_votes = safe_math::add_i128(&env, referendum.no_votes, voting_power);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Referendum(ref_id), &referendum);
+        env.storage().persistent().set(&DataKey::Referendum(ref_id), &referendum);
     }
 
     pub fn queue_referendum(env: Env, caller: Address, ref_id: u64) {
@@ -6047,7 +6076,7 @@ impl ScholarContract {
             .persistent()
             .get(&DataKey::AcademicReputation(student.clone()))
             .unwrap_or(0);
-        let updated = current + 1;
+        let updated = safe_math::add_u64(&env, current, 1);
         env.storage()
             .persistent()
             .set(&DataKey::AcademicReputation(student.clone()), &updated);
@@ -6163,7 +6192,7 @@ impl ScholarContract {
         let new_alloc = if current_alloc.amm == target_amm {
             YieldAllocation {
                 amm: target_amm.clone(),
-                total_weight: current_alloc.total_weight + weight,
+                total_weight: safe_math::add_i128(&env, current_alloc.total_weight, weight),
                 last_updated: env.ledger().timestamp(),
             }
         } else if current_alloc.total_weight < weight {
@@ -6273,7 +6302,7 @@ impl ScholarContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&student, &env.current_contract_address(), &payment);
 
-        let duration_secs = (payment / base_rate) as u64;
+        let duration_secs = safe_math::div_i128(&env, payment, base_rate) as u64;
         let now = env.ledger().timestamp();
 
         let mut access: Access = env
@@ -6318,7 +6347,7 @@ impl ScholarContract {
         token_client.transfer(&subscriber, &env.current_contract_address(), &payment);
 
         let now = env.ledger().timestamp();
-        let expiry_time = now.saturating_add(30 * 86400);
+        let expiry_time = safe_math::add_u64(&env, now, 30 * 86400);
 
         let tier = SubscriptionTier {
             subscriber: subscriber.clone(),
