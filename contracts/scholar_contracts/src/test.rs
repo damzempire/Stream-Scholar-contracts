@@ -2510,3 +2510,134 @@ fn test_e2e_oracle_to_yield_full_lifecycle() {
     // All assertions passed: the protocol handles the full lifecycle without
     // panics, logic collisions, or token leakage.
 }
+
+#[test]
+fn test_rogue_dao_vetoed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let council = Address::generate(&env);
+    let rogue_proposer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&rogue_proposer, &1000);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_security_council(&admin, &council);
+    
+    let args = Vec::from_array(&env, [rogue_proposer.into_val(&env), 500u32.into_val(&env)]);
+    let ref_id = client.create_referendum(&rogue_proposer, &contract_id, &Symbol::new(&env, "set_tax_rate"), &args, &token_address.address(), &500);
+    
+    // Rogue DAO votes yes
+    client.vote_referendum(&rogue_proposer, &ref_id, &true, &1000);
+    
+    // Fast forward to end of voting period
+    env.ledger().set_timestamp(604801); 
+    
+    // Queue the referendum for execution delay (72 hours)
+    client.queue_referendum(&rogue_proposer, &ref_id);
+    
+    // Security council notices malicious transaction and calls veto
+    client.veto_action(&council, &ref_id);
+    
+    // Fast forward past execution delay
+    env.ledger().set_timestamp(604801 + 259200 + 10);
+    
+    // Execute should fail because it was vetoed
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "execute_referendum"),
+        (&rogue_proposer, ref_id).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+#[should_panic(expected = "Execution delay not met")]
+fn test_referendum_execution_delay() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let proposer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&proposer, &1000);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    let args = Vec::from_array(&env, [proposer.into_val(&env), 500u32.into_val(&env)]);
+    let ref_id = client.create_referendum(&proposer, &contract_id, &Symbol::new(&env, "set_tax_rate"), &args, &token_address.address(), &500);
+    
+    client.vote_referendum(&proposer, &ref_id, &true, &1000);
+    
+    env.ledger().set_timestamp(604801); 
+    client.queue_referendum(&proposer, &ref_id);
+    
+    // Try to execute immediately, should panic
+    client.execute_referendum(&proposer, &ref_id);
+}
+
+#[test]
+fn test_council_rotation_and_dissolve() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let new_council = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    // Using current_contract_address directly for testing to mock DAO
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "queue_council_rotation"),
+        (&new_council,).into_val(&env)
+    );
+    // Should succeed queuing
+    assert!(result.is_ok());
+    
+    // Try to execute before timelock expires
+    let result_fail = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "execute_council_rotation"),
+        ().into_val(&env)
+    );
+    assert!(result_fail.is_err());
+    
+    // Fast forward 7 days
+    env.ledger().set_timestamp(604801);
+    
+    // Execute rotation
+    let result_success = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "execute_council_rotation"),
+        ().into_val(&env)
+    );
+    assert!(result_success.is_ok());
+    
+    // Now emergency dissolve
+    let result_dissolve = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "emergency_dissolve_council"),
+        ().into_val(&env)
+    );
+    assert!(result_dissolve.is_ok());
+}
