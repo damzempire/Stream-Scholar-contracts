@@ -867,7 +867,6 @@ fn test_academic_oracle_hook() {
     // Actually, in Soroban tests, `mock_all_auths` is very permissive.
     // If I want to test AUTH specifically, I might want to use more fine-grained auth testing.
     // But for this task, the implementation of `require_auth` in `lib.rs` is the key part.
-}
 
 #[test]
 fn test_course_registry_basic_functionality() {
