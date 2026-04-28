@@ -655,6 +655,9 @@ pub enum DataKey {
     Nonce(Address),
     DailyBurnRate,
     LastBalanceCheck,
+    ScholarshipIndex,
+    ClawbackEvidence(BytesN<32>),
+    ClawbackTerminated(Address),
     UnlockTime(Address),
     LeaderboardSize,
     IsInitialized,
@@ -1298,6 +1301,16 @@ impl ScholarContract {
     }
 
     pub fn has_access(env: Env, student: Address, course_id: u64) -> bool {
+        // Reconciliation can hard-stop a student's stream after a targeted clawback.
+        let clawback_terminated: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ClawbackTerminated(student.clone()))
+            .unwrap_or(false);
+        if clawback_terminated {
+            return false;
+        }
+
         // Check if student scholarship is disputed
         if let Some(scholarship) = env
             .storage()
@@ -1530,6 +1543,8 @@ impl ScholarContract {
             .storage()
             .persistent()
             .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        Self::upsert_scholarship_index(&env, &student);
     }
 
     pub fn withdraw_scholarship(env: Env, student: Address, amount: i128) {
@@ -2164,6 +2179,26 @@ impl ScholarContract {
         }
 
         0
+    }
+
+    pub fn get_scholarship(env: Env, student: Address) -> Scholarship {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .unwrap_or(Scholarship {
+                funder: student.clone(),
+                balance: 0,
+                token: student,
+                unlocked_balance: 0,
+                last_verif: 0,
+                is_paused: false,
+                is_disputed: false,
+                dispute_reason: None,
+                final_ruling: None,
+                is_native: false,
+                total_grant: 0,
+                final_release_claimed: false,
+            })
     }
 
     // --- Issue #110: Withdrawal Address Whitelisting ---
@@ -4533,6 +4568,205 @@ impl ScholarContract {
         
         // Return current flow rate
         env.storage().instance().get(&DataKey::TrackedTVL).unwrap_or(0)
+    }
+
+    /// Reconciles internal scholarship liabilities with the token contract ledger state
+    /// after an issuer-side SAC clawback event.
+    ///
+    /// Security model:
+    /// - Admin-gated to block arbitrary donor-triggered manipulations.
+    /// - Requires a unique `clawback_event_hash` to prevent replay.
+    /// - Requires exact delta match between expected and observed token-balance shortfall.
+    pub fn reconcile_balances(
+        env: Env,
+        admin: Address,
+        token: Address,
+        clawback_event_hash: BytesN<32>,
+        expected_clawback_amount: i128,
+        targeted_student: Option<Address>,
+        apply_protocol_haircut: bool,
+    ) -> i128 {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+
+        if expected_clawback_amount <= 0 {
+            panic!("Expected clawback amount must be positive");
+        }
+
+        let evidence_key = DataKey::ClawbackEvidence(clawback_event_hash.clone());
+        if env.storage().persistent().has(&evidence_key) {
+            panic!("Clawback evidence already processed");
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        let actual_balance = token_client.balance(&env.current_contract_address());
+
+        let (liability_before_reconciliation, _) =
+            Self::total_scholarship_liability_for_token(&env, &token);
+        if actual_balance >= liability_before_reconciliation {
+            panic!("No clawback deficit detected");
+        }
+
+        let observed_deficit = liability_before_reconciliation - actual_balance;
+        if observed_deficit != expected_clawback_amount {
+            panic!("Clawback evidence mismatch");
+        }
+
+        env.storage().persistent().set(&evidence_key, &true);
+        env.storage().instance().set(&DataKey::TrackedTVL, &actual_balance);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastBalanceCheck, &env.ledger().timestamp());
+
+        let mut affected_scholarships = Vec::new(&env);
+        if let Some(student) = targeted_student.clone() {
+            if let Some(mut scholarship) = env
+                .storage()
+                .persistent()
+                .get::<_, Scholarship>(&DataKey::Scholarship(student.clone()))
+            {
+                if scholarship.token == token {
+                    scholarship.balance = 0;
+                    scholarship.unlocked_balance = 0;
+                    scholarship.is_paused = true;
+                    scholarship.is_disputed = true;
+                    scholarship.dispute_reason = Some(symbol_short!("clawback"));
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Scholarship(student.clone()), &scholarship);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::ClawbackTerminated(student.clone()), &true);
+                    affected_scholarships.push_back(student.clone());
+
+                    #[allow(deprecated)]
+                    env.events().publish(
+                        (Symbol::new(&env, "ClawbackStreamTerminated"), student),
+                        Symbol::new(&env, "SAC targeted clawback"),
+                    );
+                }
+            }
+        }
+
+        let (total_liability, all_impacted) = Self::total_scholarship_liability_for_token(&env, &token);
+        for student in all_impacted.iter() {
+            if !affected_scholarships.contains(&student) {
+                affected_scholarships.push_back(student);
+            }
+        }
+
+        let mut shortfall = 0i128;
+        if actual_balance < total_liability {
+            shortfall = total_liability - actual_balance;
+            if apply_protocol_haircut {
+                Self::apply_protocol_haircut(&env, &token, total_liability, actual_balance);
+            } else {
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "ClawbackRefillRequired"), token.clone()),
+                    shortfall,
+                );
+            }
+        }
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "ClawbackReconciliationExecuted"), token),
+            (
+                observed_deficit,
+                shortfall,
+                apply_protocol_haircut,
+                affected_scholarships,
+            ),
+        );
+
+        shortfall
+    }
+
+    fn upsert_scholarship_index(env: &Env, student: &Address) {
+        let mut students: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ScholarshipIndex)
+            .unwrap_or(Vec::new(env));
+
+        if !students.contains(student) {
+            students.push_back(student.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::ScholarshipIndex, &students);
+        }
+    }
+
+    fn total_scholarship_liability_for_token(env: &Env, token: &Address) -> (i128, Vec<Address>) {
+        let students: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ScholarshipIndex)
+            .unwrap_or(Vec::new(env));
+
+        let mut liability = 0i128;
+        let mut impacted = Vec::new(env);
+
+        for student in students.iter() {
+            if let Some(scholarship) = env
+                .storage()
+                .persistent()
+                .get::<_, Scholarship>(&DataKey::Scholarship(student.clone()))
+            {
+                if scholarship.token == *token && scholarship.balance > 0 {
+                    liability += scholarship.balance;
+                    impacted.push_back(student);
+                }
+            }
+        }
+
+        (liability, impacted)
+    }
+
+    fn apply_protocol_haircut(env: &Env, token: &Address, old_liability: i128, new_balance: i128) {
+        if old_liability <= 0 || new_balance >= old_liability {
+            return;
+        }
+
+        let students: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ScholarshipIndex)
+            .unwrap_or(Vec::new(env));
+
+        for student in students.iter() {
+            let mut scholarship = match env
+                .storage()
+                .persistent()
+                .get::<_, Scholarship>(&DataKey::Scholarship(student.clone()))
+            {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if scholarship.token != *token || scholarship.balance <= 0 {
+                continue;
+            }
+
+            let adjusted_balance = (scholarship.balance * new_balance) / old_liability;
+            let adjusted_unlocked = core::cmp::min(scholarship.unlocked_balance, adjusted_balance);
+
+            scholarship.balance = adjusted_balance;
+            scholarship.unlocked_balance = adjusted_unlocked;
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Scholarship(student), &scholarship);
+        }
     }
     
     fn recalculate_streams_pro_rata(_env: &Env, new_balance: i128, old_balance: i128) {

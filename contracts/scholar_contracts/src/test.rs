@@ -2303,6 +2303,145 @@ fn test_private_claim_logic() {
     assert!(result_invalid.is_err());
 }
 
+#[test]
+fn test_sac_reconcile_applies_protocol_haircut() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student_a = Address::generate(&env);
+    let student_b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sa = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_sa.mint(&funder, &10_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &10, &60);
+    client.fund_scholarship(&funder, &student_a, &1_000, &token_addr.address(), &false);
+    client.fund_scholarship(&funder, &student_b, &1_000, &token_addr.address(), &false);
+
+    token_sa.clawback(&contract_id, &500);
+
+    let event_hash: soroban_sdk::BytesN<32> = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(&env, b"issuer-clawback-1"))
+        .into();
+
+    let shortfall = client.reconcile_balances(
+        &admin,
+        &token_addr.address(),
+        &event_hash,
+        &500,
+        &None,
+        &true,
+    );
+    assert_eq!(shortfall, 500);
+
+    let scholarship_a = client.get_scholarship(&student_a);
+    let scholarship_b = client.get_scholarship(&student_b);
+    assert_eq!(scholarship_a.balance, 750);
+    assert_eq!(scholarship_a.unlocked_balance, 750);
+    assert_eq!(scholarship_b.balance, 750);
+    assert_eq!(scholarship_b.unlocked_balance, 750);
+}
+
+#[test]
+fn test_sac_reconcile_targeted_student_termination() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student_a = Address::generate(&env);
+    let student_b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sa = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_sa.mint(&funder, &10_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &10, &60);
+    client.fund_scholarship(&funder, &student_a, &1_200, &token_addr.address(), &false);
+    client.fund_scholarship(&funder, &student_b, &800, &token_addr.address(), &false);
+
+    token_sa.clawback(&contract_id, &300);
+
+    let event_hash: soroban_sdk::BytesN<32> = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(&env, b"issuer-clawback-2"))
+        .into();
+
+    let shortfall = client.reconcile_balances(
+        &admin,
+        &token_addr.address(),
+        &event_hash,
+        &300,
+        &Some(student_a.clone()),
+        &false,
+    );
+    assert_eq!(shortfall, 0);
+
+    let scholarship_a = client.get_scholarship(&student_a);
+    let scholarship_b = client.get_scholarship(&student_b);
+    assert_eq!(scholarship_a.balance, 0);
+    assert_eq!(scholarship_a.unlocked_balance, 0);
+    assert!(scholarship_a.is_paused);
+    assert!(scholarship_a.is_disputed);
+    assert_eq!(scholarship_b.balance, 800);
+    assert_eq!(scholarship_b.unlocked_balance, 800);
+}
+
+#[test]
+fn test_sac_reconcile_rejects_mismatched_evidence() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sa = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_sa.mint(&funder, &5_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &10, &60);
+    client.fund_scholarship(&funder, &student, &1_000, &token_addr.address(), &false);
+
+    let event_hash: soroban_sdk::BytesN<32> = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(&env, b"forged-clawback"))
+        .into();
+
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "reconcile_balances"),
+        Vec::from_array(
+            &env,
+            [
+                admin.into_val(&env),
+                token_addr.address().into_val(&env),
+                event_hash.into_val(&env),
+                500_i128.into_val(&env),
+                Option::<Address>::None.into_val(&env),
+                false.into_val(&env),
+            ],
+        ),
+    );
+    assert!(result.is_err());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue #209 — Final E2E Integration Test (Oracle to Yield)
 //
