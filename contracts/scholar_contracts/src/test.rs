@@ -2510,3 +2510,106 @@ fn test_e2e_oracle_to_yield_full_lifecycle() {
     // All assertions passed: the protocol handles the full lifecycle without
     // panics, logic collisions, or token leakage.
 }
+
+#[test]
+fn test_set_security_council() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let council = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    client.set_security_council(&admin, &council);
+    
+    // We cannot read SecurityCouncil directly unless there's a getter, but 
+    // we can verify it doesn't panic when an authorized admin sets it.
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_set_security_council_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let fake_admin = Address::generate(&env);
+    let council = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    // Should panic because fake_admin is not the admin
+    client.set_security_council(&fake_admin, &council);
+}
+
+#[test]
+#[should_panic(expected = "Security Council not set")]
+fn test_upgrade_contract_without_council_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let new_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    // Should panic because council was never set
+    let fake_council = Address::generate(&env);
+    client.upgrade_contract(&fake_council, &new_wasm_hash);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized: Caller is not the Security Council")]
+fn test_upgrade_contract_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let council = Address::generate(&env);
+    let fake_council = Address::generate(&env);
+    let new_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_security_council(&admin, &council);
+    
+    // Should panic because fake_council is not the set council
+    client.upgrade_contract(&fake_council, &new_wasm_hash);
+}
+
+#[test]
+fn test_upgrade_contract_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let council = Address::generate(&env);
+    let new_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_security_council(&admin, &council);
+    
+    // In soroban test environments, update_current_contract_wasm works if authorized.
+    // It will return success (no panic).
+    client.upgrade_contract(&council, &new_wasm_hash);
+}

@@ -5496,7 +5496,46 @@ impl ScholarContract {
         env.storage().instance().set(&DataKey::IsPaused, &false);
         env.storage().instance().remove(&DataKey::PauseTimestamp);
     }
+    
+    // -------------------------------------------------------------------------
+    // Modular Upgrades Pattern via Multi-Signature Governance
+    // -------------------------------------------------------------------------
+    
+    /// Admin configures the Security Council address. The Security Council acts as the
+    /// multi-signature governance body for critical protocol changes, including upgrades.
+    pub fn set_security_council(env: Env, admin: Address, council: Address) {
+        admin.require_auth();
+        
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        
+        env.storage().instance().set(&DataKey::SecurityCouncil, &council);
+    }
 
+    /// Upgrades the contract's WASM code. Strictly controlled by the Security Council.
+    /// The Security Council is expected to be a multi-signature Stellar account.
+    pub fn upgrade_contract(env: Env, council: Address, new_wasm_hash: BytesN<32>) {
+        council.require_auth();
+        
+        let stored_council: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SecurityCouncil)
+            .expect("Security Council not set");
+            
+        if stored_council != council {
+            panic!("Unauthorized: Caller is not the Security Council");
+        }
+        
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+    
     fn extend_all_access_periods(_env: &Env, _pause_duration: u64) {
         // Simplified implementation - in production, you'd maintain a list of active accesses
         // For now, this is a placeholder for the access extension logic
