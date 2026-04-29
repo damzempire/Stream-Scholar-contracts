@@ -104,6 +104,8 @@ const FINAL_RELEASE_RATE_LIMIT_MAX_ATTEMPTS: u32 = 1; // Only 1 final release at
 
 mod issue_features;
 mod safe_math;
+mod string_validation;
+use string_validation::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Internal contract event variants.
@@ -1043,6 +1045,25 @@ pub enum MathErr {
     Overflow = 20,
     Underflow = 21,
     DivisionByZero = 22,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+/// Errors related to string validation in scholarship metadata.
+pub enum StringValidationError {
+    EmptyString = 601,
+    TooShort = 602,
+    TooLong = 603,
+    InvalidCharacter = 604,
+    MaliciousContent = 605,
+    InvalidFormat = 606,
+    EmptyMetadata = 607,
+    MetadataTooLarge = 608,
+    EmptyMetadataKey = 609,
+    MetadataKeyTooLong = 610,
+    MetadataValueTooLong = 611,
+    InvalidRarity = 612,
 }
 
 #[contracttype]
@@ -2810,6 +2831,9 @@ impl ScholarContract {
         reason: Symbol,
     ) {
         university_admin.require_auth();
+
+        // Validate reason symbol
+        validate_symbol_or_panic(&env, &reason, "security_hold_reason");
         let registered_admin: Address = env
             .storage()
             .persistent()
@@ -5382,21 +5406,9 @@ impl ScholarContract {
             ));
         }
 
-        // Validate evidence hash is not empty
-        if payload.evidence_hash.is_empty() {
-            env.panic_with_error((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidAction,
-            ));
-        }
-
-        // Validate reason is not empty
-        if payload.reason.is_empty() {
-            env.panic_with_error((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidAction,
-            ));
-        }
+        // Validate evidence hash and reason with comprehensive checks
+        validate_bytes_or_panic(env, &payload.evidence_hash, "disciplinary_evidence_hash");
+        validate_bytes_or_panic(env, &payload.reason, "disciplinary_reason");
 
         // Validate oracle signatures (simplified check)
         let threshold: u32 = env
