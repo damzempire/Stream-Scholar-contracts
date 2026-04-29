@@ -1,5 +1,5 @@
 #![no_std]
-use crate::ScholarError;
+use crate::{ScholarError, string_validation::*};
 use soroban_sdk::{
     contract, contractimpl, contracttype, Address, BytesN, Env, Map, String, Symbol, Vec,
 };
@@ -143,6 +143,10 @@ impl StudentProfileNFTContract {
     ) -> BytesN<32> {
         owner.require_auth();
 
+        // Validate student_id and metadata
+        validate_student_id_or_panic(&env, &student_id);
+        validate_metadata_or_panic(&env, &initial_metadata);
+
         // Generate unique token ID
         let next_id: u64 = env
             .storage()
@@ -238,6 +242,9 @@ impl StudentProfileNFTContract {
     /// - Panics if NFT not found
     pub fn update_xp(env: Env, student_id: String, xp_amount: u64, caller: Address) {
         caller.require_auth();
+
+        // Validate student_id
+        validate_student_id_or_panic(&env, &student_id);
 
         // Get token ID from student profile
         let token_id: BytesN<32> = env
@@ -338,6 +345,18 @@ impl StudentProfileNFTContract {
         caller: Address,
     ) {
         caller.require_auth();
+
+        // Validate student_id and achievement data
+        validate_student_id_or_panic(&env, &student_id);
+        validate_achievement_complete_or_panic(
+            &env,
+            &achievement.id,
+            &achievement.title,
+            &achievement.description,
+            &achievement.icon,
+            &achievement.category,
+            &achievement.rarity,
+        );
 
         // Get token ID from student profile
         let token_id: BytesN<32> = env
@@ -486,6 +505,9 @@ impl StudentProfileNFTContract {
     /// - Panics if student profile not found
     /// - Panics if NFT not found
     pub fn get_nft_by_student(env: Env, student_id: String) -> StudentProfileNFT {
+        // Validate student_id
+        validate_student_id_or_panic(&env, &student_id);
+        
         let token_id: BytesN<32> = env
             .storage()
             .persistent()
@@ -637,6 +659,9 @@ impl StudentProfileNFTContract {
     /// - Prevent duplicate minting
     /// - Validate student ID before operations
     pub fn student_exists(env: Env, student_id: String) -> bool {
+        // Validate student_id
+        validate_student_id_or_panic(&env, &student_id);
+        
         env.storage()
             .persistent()
             .get::<DataKey, BytesN<32>>(&DataKey::StudentProfile(student_id))
