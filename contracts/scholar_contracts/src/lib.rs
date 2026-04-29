@@ -568,14 +568,44 @@ pub struct SlashedStudent {
 /// Storage key enumeration for all contract state.
 #[contracttype]
 /// Storage key enumeration for all contract state.
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+
+impl ProtocolConfig {
+    pub fn get(e: &Env) -> Self {
+        e.storage().instance().get(&DataKey::Config).unwrap_or(ProtocolConfig {
+            base_rate: 0,
+            discount_threshold: 0,
+            discount_percentage: 0,
+            min_deposit: 0,
+            heartbeat_interval: 0,
+            referral_bonus: 0,
+            streak_bonus: 0,
+        })
+    }
+
+    pub fn set(e: &Env, config: &ProtocolConfig) {
+        e.storage().instance().set(&DataKey::Config, config);
+    }
+}
+
+pub struct ProtocolConfig {
+    pub base_rate: i128,
+    pub discount_threshold: u64,
+    pub discount_percentage: u32,
+    pub min_deposit: i128,
+    pub heartbeat_interval: u64,
+    pub referral_bonus: i128,
+    pub streak_bonus: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub enum DataKey {
+    Config,
     Access(Address, u64),
-    BaseRate,
-    DiscountThreshold,
-    DiscountPercentage,
-    MinDeposit,
     Subscription(Address),
-    HeartbeatInterval,
     CourseDuration(u64),
     SbtMinted(Address, u64),
     Admin,
@@ -590,7 +620,6 @@ pub enum DataKey {
     CourseInfo(u64),
     BonusMinutes(Address),
     HasBeenReferred(Address),
-    ReferralBonusAmount,
     RoyaltySplit(u64), // course_id -> RoyaltySplit
     // PoA (Proof-of-Attendance) related keys
     PoAConfig,
@@ -598,7 +627,6 @@ pub enum DataKey {
     StudentPoAState(Address, u64), // student, course_id -> StudentPoAState
     AttendanceProof(Address, u64, u64), // student, course_id, checkpoint_number -> AttendanceProof
     ConsecutiveDays(Address, u64), // student, course_id -> StreakData
-    StreakBonusAmount,
     GroupPool(u64),                    // pool_id -> GroupPool
     GroupPoolMember(u64, Address),     // pool_id, member -> contribution amount
     GroupPoolAccess(u64, Address),     // pool_id, member -> access granted
