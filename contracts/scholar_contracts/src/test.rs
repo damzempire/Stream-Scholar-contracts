@@ -2780,3 +2780,434 @@ fn test_council_rotation_and_dissolve() {
     );
     assert!(result_dissolve.is_ok());
 }
+
+// --- Multi-Language Course Metadata Tests (Issue #46) ---
+
+#[test]
+fn test_register_course_with_metadata() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Verify course info
+    let course_info = client.get_course_info(&course_id).unwrap();
+    assert_eq!(course_info.course_id, course_id);
+    assert_eq!(course_info.creator, creator);
+    assert_eq!(course_info.default_language, default_language);
+    assert_eq!(course_info.available_languages.len(), 1);
+    assert!(course_info.available_languages.contains(&default_language));
+    assert!(course_info.is_active);
+
+    // Verify metadata
+    let metadata = client.get_course_metadata(&course_id, &default_language).unwrap();
+    assert_eq!(metadata.language_code, default_language);
+    assert_eq!(metadata.title, Symbol::new(&env, "Introduction to Blockchain"));
+    assert_eq!(metadata.description, Symbol::new(&env, "Learn the fundamentals of blockchain technology"));
+
+    // Verify course registry
+    let registry = client.get_course_registry().unwrap();
+    assert_eq!(registry.courses.len(), 1);
+    assert!(registry.courses.contains(&course_id));
+}
+
+#[test]
+fn test_add_multiple_languages() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Add Spanish version
+    let spanish_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "es"),
+        ipfs_link: Symbol::new(&env, "QmSpanish123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introducción a Blockchain"),
+        description: Symbol::new(&env, "Aprende los fundamentos de la tecnología blockchain"),
+        updated_at: 0,
+    };
+
+    client.update_course_metadata(&admin, &course_id, &spanish_metadata);
+
+    // Add French version
+    let french_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "fr"),
+        ipfs_link: Symbol::new(&env, "QmFrench123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction à la Blockchain"),
+        description: Symbol::new(&env, "Apprenez les fondamentaux de la technologie blockchain"),
+        updated_at: 0,
+    };
+
+    client.update_course_metadata(&admin, &course_id, &french_metadata);
+
+    // Verify all languages are available
+    let languages = client.get_course_languages(&course_id);
+    assert_eq!(languages.len(), 3);
+    assert!(languages.contains(&Symbol::new(&env, "en")));
+    assert!(languages.contains(&Symbol::new(&env, "es")));
+    assert!(languages.contains(&Symbol::new(&env, "fr")));
+
+    // Verify each language metadata
+    let en_metadata = client.get_course_metadata(&course_id, &Symbol::new(&env, "en")).unwrap();
+    assert_eq!(en_metadata.title, Symbol::new(&env, "Introduction to Blockchain"));
+
+    let es_metadata = client.get_course_metadata(&course_id, &Symbol::new(&env, "es")).unwrap();
+    assert_eq!(es_metadata.title, Symbol::new(&env, "Introducción a Blockchain"));
+
+    let fr_metadata = client.get_course_metadata(&course_id, &Symbol::new(&env, "fr")).unwrap();
+    assert_eq!(fr_metadata.title, Symbol::new(&env, "Introduction à la Blockchain"));
+}
+
+#[test]
+fn test_remove_language() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Add Spanish version
+    let spanish_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "es"),
+        ipfs_link: Symbol::new(&env, "QmSpanish123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introducción a Blockchain"),
+        description: Symbol::new(&env, "Aprende los fundamentos de la tecnología blockchain"),
+        updated_at: 0,
+    };
+
+    client.update_course_metadata(&admin, &course_id, &spanish_metadata);
+
+    // Verify both languages exist
+    let languages = client.get_course_languages(&course_id);
+    assert_eq!(languages.len(), 2);
+
+    // Remove Spanish language
+    client.remove_course_language(&admin, &course_id, &Symbol::new(&env, "es"));
+
+    // Verify only English remains
+    let languages = client.get_course_languages(&course_id);
+    assert_eq!(languages.len(), 1);
+    assert!(languages.contains(&Symbol::new(&env, "en")));
+    assert!(!languages.contains(&Symbol::new(&env, "es")));
+
+    // Verify Spanish metadata is removed
+    assert!(client.get_course_metadata(&course_id, &Symbol::new(&env, "es")).is_none());
+    assert!(client.get_course_metadata(&course_id, &Symbol::new(&env, "en")).is_some());
+}
+
+#[test]
+fn test_cannot_remove_default_language() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Try to remove default language - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "remove_course_language"),
+        (&admin, course_id, default_language).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_invalid_language_code() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let invalid_language = Symbol::new(&env, "INVALID"); // Too long and uppercase
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "INVALID"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Try to register with invalid language code - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&admin, course_id, creator, invalid_language, initial_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_invalid_ipfs_link() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "invalid_link"), // Too short and invalid format
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course with valid initial metadata
+    let valid_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    client.register_course(&admin, &course_id, &creator, &default_language, &valid_metadata);
+
+    // Try to update with invalid IPFS link - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "update_course_metadata"),
+        (&admin, course_id, initial_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_unauthorized_access() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let unauthorized_user = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Try to register course with unauthorized user - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&unauthorized_user, course_id, creator, default_language, initial_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+
+    // Register with admin first
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Try to update with unauthorized user - should fail
+    let spanish_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "es"),
+        ipfs_link: Symbol::new(&env, "QmSpanish123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introducción a Blockchain"),
+        description: Symbol::new(&env, "Aprende los fundamentos de la tecnología blockchain"),
+        updated_at: 0,
+    };
+
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "update_course_metadata"),
+        (&unauthorized_user, course_id, spanish_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_duplicate_course_registration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Try to register same course again - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&admin, course_id, creator, default_language, initial_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_course_registry_size_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let default_language = Symbol::new(&env, "en");
+    
+    // Register courses up to the limit
+    for i in 1..=MAX_COURSE_REGISTRY_SIZE {
+        let course_id = i;
+        let initial_metadata = CourseMetadata {
+            language_code: Symbol::new(&env, "en"),
+            ipfs_link: Symbol::new(&env, &format!("QmTest{:046}", i)[..]),
+            title: Symbol::new(&env, &format!("Course {}", i)[..]),
+            description: Symbol::new(&env, &format!("Description for course {}", i)[..]),
+            updated_at: 0,
+        };
+
+        client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+    }
+
+    // Try to register one more course - should fail
+    let overflow_course_id = MAX_COURSE_REGISTRY_SIZE + 1;
+    let overflow_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmOverflow123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Overflow Course"),
+        description: Symbol::new(&env, "This course should not be registered"),
+        updated_at: 0,
+    };
+
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&admin, overflow_course_id, creator, default_language, overflow_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+}
