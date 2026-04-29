@@ -72,12 +72,21 @@ const VELOCITY_WINDOW: u64 = 86400; // 24 hours in seconds
 const DEPLETED_SWEEP_THRESHOLD: u64 = 7776000; // 90 days in seconds
 const RENT_BUMP_AMOUNT: i128 = 1; // 1 stroop micro-fraction for TTL extension
 
+// Auto_Rent_Deduction hook — long-term grant storage protection
+// Re-exported from auto_rent module for use in contract functions.
+use auto_rent::{auto_rent_deduction, last_rent_extended};
+
 // Issue #192: Quadratic Voting for Community Grants
 const QUADRATIC_ROUND_DURATION: u64 = 2592000; // 30-day voting round
 
 // Issue #197: Dynamic Fee Adjustment via DAO
 const MAX_FEE_BPS: u32 = 500; // 5% maximum fee cap
 const FEE_EPOCH_DURATION: u64 = 2592000; // 30-day epoch between fee updates
+const REFINANCE_FEE_BPS: u32 = 100; // 1% protocol fee on grant refinancings
+
+// Issue: Alumni State Pruning — ledger footprint management
+const ALUMNI_PRUNE_ZERO_BALANCE_PERIOD: u64 = 365 * 24 * 60 * 60; // 1 year after zero balance
+const ALUMNI_PRUNE_BOUNTY_BPS: u64 = 500; // 5% of reclaimed rent as gas bounty
 
 use expiry_math::checked_access_expiry;
 
@@ -93,8 +102,17 @@ const APPEAL_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
 /// Duration of a university-triggered security hold (7 days).
 const SECURITY_HOLD_DURATION: u64 = 7 * 24 * 60 * 60;
 
+// Rate limiting constants for student claim functions
+const CLAIM_RATE_LIMIT_WINDOW: u64 = 3600; // 1 hour window in seconds
+const CLAIM_RATE_LIMIT_MAX_ATTEMPTS: u32 = 3; // Max 3 claims per hour
+const PRIVATE_CLAIM_RATE_LIMIT_WINDOW: u64 = 3600; // 1 hour window for private claims
+const PRIVATE_CLAIM_RATE_LIMIT_MAX_ATTEMPTS: u32 = 2; // Max 2 private claims per hour (more restrictive)
+const FINAL_RELEASE_RATE_LIMIT_WINDOW: u64 = 86400; // 24 hours for final release
+const FINAL_RELEASE_RATE_LIMIT_MAX_ATTEMPTS: u32 = 1; // Only 1 final release attempt per day
+
 mod issue_features;
 mod safe_math;
+mod auto_rent;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Internal contract event variants.
@@ -556,14 +574,44 @@ pub struct SlashedStudent {
 /// Storage key enumeration for all contract state.
 #[contracttype]
 /// Storage key enumeration for all contract state.
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+
+impl ProtocolConfig {
+    pub fn get(e: &Env) -> Self {
+        e.storage().instance().get(&DataKey::Config).unwrap_or(ProtocolConfig {
+            base_rate: 0,
+            discount_threshold: 0,
+            discount_percentage: 0,
+            min_deposit: 0,
+            heartbeat_interval: 0,
+            referral_bonus: 0,
+            streak_bonus: 0,
+        })
+    }
+
+    pub fn set(e: &Env, config: &ProtocolConfig) {
+        e.storage().instance().set(&DataKey::Config, config);
+    }
+}
+
+pub struct ProtocolConfig {
+    pub base_rate: i128,
+    pub discount_threshold: u64,
+    pub discount_percentage: u32,
+    pub min_deposit: i128,
+    pub heartbeat_interval: u64,
+    pub referral_bonus: i128,
+    pub streak_bonus: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub enum DataKey {
+    Config,
     Access(Address, u64),
-    BaseRate,
-    DiscountThreshold,
-    DiscountPercentage,
-    MinDeposit,
     Subscription(Address),
-    HeartbeatInterval,
     CourseDuration(u64),
     SbtMinted(Address, u64),
     Admin,
@@ -580,7 +628,6 @@ pub enum DataKey {
     CourseLanguageIndex(u64),     // course_id -> Vec<Symbol> (available languages)
     BonusMinutes(Address),
     HasBeenReferred(Address),
-    ReferralBonusAmount,
     RoyaltySplit(u64), // course_id -> RoyaltySplit
     // PoA (Proof-of-Attendance) related keys
     PoAConfig,
@@ -588,7 +635,6 @@ pub enum DataKey {
     StudentPoAState(Address, u64), // student, course_id -> StudentPoAState
     AttendanceProof(Address, u64, u64), // student, course_id, checkpoint_number -> AttendanceProof
     ConsecutiveDays(Address, u64), // student, course_id -> StreakData
-    StreakBonusAmount,
     GroupPool(u64),                    // pool_id -> GroupPool
     GroupPoolMember(u64, Address),     // pool_id, member -> contribution amount
     GroupPoolAccess(u64, Address),     // pool_id, member -> access granted
@@ -640,6 +686,8 @@ pub enum DataKey {
     ResearchBonusFund,
     SurpriseBonusRecipient(u64),
     AlumniPledge(Address),
+    SponsorMapping(Address),
+    KycVerified(Address),
     SponsorProfile(Address),
     CrossChainMessage(BytesN<32>),
     Stream(Address, Address),
@@ -696,6 +744,15 @@ pub enum DataKey {
     CommitteeApprovalBitmap(Address, u64, u64),
     GrantCommitteeNonce(Address, u64),
     MilestoneReviewSession(Address, u64, u64),
+    // Alumni State Pruning keys
+    GrantMetadata(Address),           // student -> GrantMetadata (heavy)
+    TranscriptEvidence(Address),      // student -> TranscriptEvidence (heavy)
+    DiplomaHash(Address),             // student -> BytesN<32> (lightweight audit proof)
+    ZeroBalanceTimestamp(Address),    // student -> u64 (when stream hit zero balance)
+    AlumniPruneReceipt(Address),      // student -> AlumniPruneReceipt
+    // Auto-Rent Deduction hook — records the last time the instance TTL was
+    // automatically extended by the claim_scholarship / withdraw_scholarship loop.
+    RentLastExtended,                 // u64 timestamp of last auto-rent extension
 }
 
 #[contracttype]
@@ -705,6 +762,15 @@ pub struct YieldAllocation {
     pub amm: Address,
     pub total_weight: i128,
     pub last_updated: u64,
+}
+
+/// Rate limiting information for student claim functions
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RateLimitInfo {
+    pub last_claim_time: u64,      // Timestamp of last claim attempt
+    pub claim_count: u32,          // Number of claims in current window
+    pub window_start: u64,         // Start time of current window
 }
 
 /// Issue #233: aggregate matching attribution per institution (school).
@@ -746,6 +812,57 @@ pub struct ReputationExportLedgerRow {
 pub struct MilestoneReviewSession {
     pub started_at: u64,
     pub finalized: bool,
+}
+
+// Alumni State Pruning structs
+
+#[contracttype]
+#[derive(Clone)]
+/// Heavy grant metadata for a student's scholarship — pruned after graduation + zero balance.
+pub struct GrantMetadata {
+    pub student: Address,
+    pub total_grant: i128,
+    pub token: Address,
+    pub funder: Address,
+    pub disbursement_schedule: Vec<u64>,
+    pub grant_terms_hash: BytesN<32>,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+/// Heavy transcript evidence — pruned after graduation + zero balance.
+pub struct TranscriptEvidence {
+    pub student: Address,
+    pub course_id: u64,
+    pub checkpoint_hashes: Vec<BytesN<32>>,
+    pub final_gpa_scaled: u64,
+    pub advisor_signature: Bytes,
+    pub recorded_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+/// Receipt emitted when a relayer prunes alumni state, proving the sweep was valid.
+pub struct AlumniPruneReceipt {
+    pub student: Address,
+    pub relayer: Address,
+    pub diploma_hash: BytesN<32>,
+    pub pruned_at: u64,
+    pub bounty_stroops: i128,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+/// Errors returned by alumni pruning operations.
+pub enum AlumniPruneError {
+    NotGraduated = 30,
+    BalanceNotZero = 31,
+    ZeroBalanceTooRecent = 32,
+    PendingMilestone = 33,
+    AlreadyPruned = 34,
+    NoHeavyDataToPrune = 35,
 }
 
 #[contracttype]
@@ -1012,11 +1129,33 @@ pub enum ScholarErr {
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
+pub enum RefinanceError {
+    ScholarshipNotFound = 30,
+    UnauthorizedSponsor = 31,
+    InsufficientFunds = 32,
+    KycNotVerified = 33,
+    InvalidStudentConsent = 34,
+    StreamAlreadyExists = 35,
+    InvalidRefinanceRequest = 36,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 /// Errors related to privacy-preserving operations.
 pub enum PrivacyError {
     NullifierAlreadyUsed = 10,
     InvalidCommitment = 11,
     ProofVerificationFailed = 12,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+/// Errors related to rate limiting on claim functions.
+pub enum RateLimitError {
+    RateLimitExceeded = 30,
+    TooManyClaims = 31,
 }
 
 #[contracterror]
@@ -1028,6 +1167,25 @@ pub enum MathErr {
     Overflow = 20,
     Underflow = 21,
     DivisionByZero = 22,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+/// Errors related to string validation in scholarship metadata.
+pub enum StringValidationError {
+    EmptyString = 601,
+    TooShort = 602,
+    TooLong = 603,
+    InvalidCharacter = 604,
+    MaliciousContent = 605,
+    InvalidFormat = 606,
+    EmptyMetadata = 607,
+    MetadataTooLarge = 608,
+    EmptyMetadataKey = 609,
+    MetadataKeyTooLong = 610,
+    MetadataValueTooLong = 611,
+    InvalidRarity = 612,
 }
 
 #[contracttype]
@@ -1856,8 +2014,194 @@ impl ScholarContract {
         env.storage()
             .persistent()
             .set(&DataKey::Scholarship(student.clone()), &scholarship);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SponsorMapping(student.clone()), &funder);
 
         Self::upsert_scholarship_index(&env, &student);
+    }
+
+    fn current_refinance_payload(
+        _env: &Env,
+        _student: &Address,
+        _old_sponsor: &Address,
+        _new_sponsor: &Address,
+        _remaining_balance: i128,
+        _token: &Address,
+        request_payload: &Bytes,
+    ) -> Bytes {
+        request_payload.clone()
+    }
+
+    fn verify_student_refinance_consent(
+        env: &Env,
+        student: &Address,
+        payload: &Bytes,
+        signature: &BytesN<64>,
+    ) {
+        if signature == soroban_sdk::BytesN::from_array(env, &[0u8; 64]) {
+            env.panic_with_error(RefinanceError::InvalidStudentConsent);
+        }
+
+        // Placeholder: In production this would verify an Ed25519 signature from the
+        // student's public key over the refinancing payload.
+        let _ = (student, payload, signature);
+    }
+
+    fn check_kyc_status(env: &Env, sponsor: &Address) -> Result<(), RefinanceError> {
+        let verified: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycVerified(sponsor.clone()))
+            .unwrap_or(false);
+        if verified {
+            Ok(())
+        } else {
+            Err(RefinanceError::KycNotVerified)
+        }
+    }
+
+    pub fn set_kyc_status(env: Env, admin: Address, sponsor: Address, verified: bool) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error(ScholarErr::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::KycVerified(sponsor), &verified);
+    }
+
+    pub fn refinance_grant(
+        env: Env,
+        student: Address,
+        old_sponsor: Address,
+        new_sponsor: Address,
+        token: Address,
+        student_signature: BytesN<64>,
+        request_payload: Bytes,
+    ) -> i128 {
+        new_sponsor.require_auth();
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .unwrap_or_else(|| env.panic_with_error(RefinanceError::ScholarshipNotFound));
+
+        if scholarship.funder != old_sponsor {
+            env.panic_with_error(RefinanceError::UnauthorizedSponsor);
+        }
+
+        if old_sponsor == new_sponsor {
+            env.panic_with_error(RefinanceError::InvalidRefinanceRequest);
+        }
+
+        if scholarship.token != token {
+            env.panic_with_error(RefinanceError::InvalidRefinanceRequest);
+        }
+
+        Self::check_kyc_status(&env, &new_sponsor).unwrap_or_else(|err| env.panic_with_error(err));
+
+        let remaining_balance = scholarship.balance;
+        if remaining_balance <= 0 {
+            env.panic_with_error(RefinanceError::InvalidRefinanceRequest);
+        }
+
+        let payload = Self::current_refinance_payload(
+            &env,
+            &student,
+            &old_sponsor,
+            &new_sponsor,
+            remaining_balance,
+            &token,
+            &request_payload,
+        );
+        Self::verify_student_refinance_consent(&env, &student, &payload, &student_signature);
+
+        let fee_amount = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, remaining_balance, REFINANCE_FEE_BPS as i128),
+            10000,
+        );
+        let total_payment = safe_math::add_i128(&env, remaining_balance, fee_amount);
+
+        let token_client = token::Client::new(&env, &token);
+        let new_sponsor_balance = token_client.balance(&new_sponsor);
+        if new_sponsor_balance < total_payment {
+            env.panic_with_error(RefinanceError::InsufficientFunds);
+        }
+
+        token_client.transfer(&new_sponsor, &old_sponsor, &remaining_balance);
+        if fee_amount > 0 {
+            token_client.transfer(&new_sponsor, &env.current_contract_address(), &fee_amount);
+            let existing_fees: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProtocolFeesAccrued(token.clone()))
+                .unwrap_or(0);
+            let updated_fees = safe_math::add_i128(&env, existing_fees, fee_amount);
+            env.storage()
+                .instance()
+                .set(&DataKey::ProtocolFeesAccrued(token.clone()), &updated_fees);
+        }
+
+        scholarship.funder = new_sponsor.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SponsorMapping(student.clone()), &new_sponsor);
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Stream(old_sponsor.clone(), student.clone()))
+        {
+            let mut stream: Stream = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Stream(old_sponsor.clone(), student.clone()))
+                .unwrap();
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::Stream(new_sponsor.clone(), student.clone()))
+            {
+                env.panic_with_error(RefinanceError::StreamAlreadyExists);
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Stream(old_sponsor.clone(), student.clone()));
+            stream.funder = new_sponsor.clone();
+            env.storage()
+                .persistent()
+                .set(&DataKey::Stream(new_sponsor.clone(), student.clone()), &stream);
+        }
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "GrantRefinanced"),
+                old_sponsor.clone(),
+                new_sponsor.clone(),
+            ),
+            remaining_balance,
+        );
+
+        remaining_balance
+    }
+
+    pub fn get_sponsor_mapping(env: Env, student: Address) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SponsorMapping(student.clone()))
+            .unwrap_or_else(|| env.panic_with_error(RefinanceError::ScholarshipNotFound))
     }
 
     /// Withdraws tokens from a student's scholarship balance.
@@ -1995,6 +2339,18 @@ impl ScholarContract {
         let client = token::Client::new(&env, &scholarship.token);
         client.transfer(&env.current_contract_address(), &student, &net_amount);
 
+        // Auto_Rent_Deduction hook: on every successful withdrawal, attempt to
+        // extend the contract instance TTL if it is below the safety threshold.
+        // The deduction is micro-sized (≤100 stroops) and skipped on failure so
+        // the student's payout is never blocked.
+        auto_rent_deduction(
+            &env,
+            &student,
+            amount,
+            &scholarship.token,
+            scholarship.is_native,
+        );
+
         // Accrue protocol fees separately to avoid mixing with other balances.
         if tax_amount > 0 {
             let key = DataKey::ProtocolFeesAccrued(scholarship.token.clone());
@@ -2005,8 +2361,6 @@ impl ScholarContract {
             env.storage().instance().set(&key, &updated);
         }
     }
-
-    // --- Issue #112: Scholarship_Simulate_Claim_Dry-Run_Helper ---
     /// Sets the tax rate for scholarship withdrawals (in basis points).
     ///
     /// # Input Requirements
@@ -2539,6 +2893,17 @@ impl ScholarContract {
     pub fn claim_final_release(env: Env, student: Address) {
         student.require_auth();
 
+        // Check rate limits before processing final release claim (most restrictive)
+        if let Err(rate_error) = Self::check_rate_limit(
+            &env,
+            &student,
+            DataKey::FinalReleaseRateLimit(student.clone()),
+            FINAL_RELEASE_RATE_LIMIT_WINDOW,
+            FINAL_RELEASE_RATE_LIMIT_MAX_ATTEMPTS,
+        ) {
+            env.panic_with_error(rate_error);
+        }
+
         let vote: CommunityVote = env
             .storage()
             .persistent()
@@ -2644,6 +3009,283 @@ impl ScholarContract {
         env.storage()
             .persistent()
             .get(&DataKey::GraduationRegistry(student))
+    }
+
+    // --- Alumni State Pruning: ledger footprint management ---
+
+    /// Store grant metadata for a student. Called during scholarship setup.
+    pub fn store_grant_metadata(
+        env: Env,
+        student: Address,
+        total_grant: i128,
+        token: Address,
+        funder: Address,
+        disbursement_schedule: Vec<u64>,
+        grant_terms_hash: BytesN<32>,
+    ) {
+        let meta = GrantMetadata {
+            student: student.clone(),
+            total_grant,
+            token,
+            funder,
+            disbursement_schedule,
+            grant_terms_hash,
+            created_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::GrantMetadata(student.clone()), &meta);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GrantMetadata(student),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    /// Store transcript evidence for a student. Called upon course completion.
+    pub fn store_transcript_evidence(
+        env: Env,
+        student: Address,
+        course_id: u64,
+        checkpoint_hashes: Vec<BytesN<32>>,
+        final_gpa_scaled: u64,
+        advisor_signature: Bytes,
+    ) {
+        let evidence = TranscriptEvidence {
+            student: student.clone(),
+            course_id,
+            checkpoint_hashes,
+            final_gpa_scaled,
+            advisor_signature,
+            recorded_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::TranscriptEvidence(student.clone()), &evidence);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TranscriptEvidence(student),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    /// Record the timestamp when a student's stream/scholarship balance hits zero.
+    /// Called internally when balance transitions to zero.
+    fn record_zero_balance_timestamp(env: &Env, student: &Address) {
+        let key = DataKey::ZeroBalanceTimestamp(student.clone());
+        // Only record the first time balance hits zero (don't overwrite)
+        if env.storage().persistent().get::<_, u64>(&key).is_none() {
+            env.storage()
+                .persistent()
+                .set(&key, &env.ledger().timestamp());
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+    }
+
+    /// Prune heavy alumni state from the ledger after graduation + 1-year zero balance.
+    ///
+    /// Callable by a decentralized relayer or the university to reclaim storage rent.
+    /// The function verifies:
+    /// 1. Student has graduated (GraduationRegistry entry exists)
+    /// 2. Scholarship/stream balance has been zero for over 1 year
+    /// 3. No pending milestones remain (security: cannot touch active students)
+    ///
+    /// On success, deletes GrantMetadata and TranscriptEvidence (heavy data),
+    /// preserves a lightweight DiplomaHash for future audit, and awards the
+    /// relayer a small bounty from the reclaimed rent.
+    pub fn prune_alumni_state(env: Env, relayer: Address, student: Address) -> AlumniPruneReceipt {
+        relayer.require_auth();
+
+        // 1. Verify student has graduated
+        let _profile: GraduateProfile = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GraduationRegistry(student.clone()))
+            .unwrap_or_else(|| {
+                env.panic_with_error(AlumniPruneError::NotGraduated);
+            });
+
+        // 2. Check already pruned
+        if env
+            .storage()
+            .persistent()
+            .get::<_, AlumniPruneReceipt>(&DataKey::AlumniPruneReceipt(student.clone()))
+            .is_some()
+        {
+            env.panic_with_error(AlumniPruneError::AlreadyPruned);
+        }
+
+        // 3. Verify scholarship balance is zero
+        let scholarship: Option<Scholarship> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()));
+        if let Some(sch) = &scholarship {
+            if sch.balance != 0 {
+                env.panic_with_error(AlumniPruneError::BalanceNotZero);
+            }
+        }
+
+        // Also check all streams for zero balance
+        // A student with any active stream with remaining balance cannot be pruned
+        // We verify via the ZeroBalanceTimestamp which is set when balance hits zero
+        let zero_balance_ts: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ZeroBalanceTimestamp(student.clone()))
+            .unwrap_or_else(|| {
+                env.panic_with_error(AlumniPruneError::BalanceNotZero);
+            });
+
+        // 4. Verify zero balance has persisted for over 1 year
+        let current_time = env.ledger().timestamp();
+        if current_time.saturating_sub(zero_balance_ts) < ALUMNI_PRUNE_ZERO_BALANCE_PERIOD {
+            env.panic_with_error(AlumniPruneError::ZeroBalanceTooRecent);
+        }
+
+        // 5. SECURITY: Verify no pending milestones — sweeper cannot touch active students
+        // Check bounty reserves for any unclaimed milestones
+        // We iterate through the graduate profile's completed scholarships to check
+        if let Some(profile) = env
+            .storage()
+            .persistent()
+            .get::<_, GraduateProfile>(&DataKey::GraduationRegistry(student.clone()))
+        {
+            let mut i: u32 = 0;
+            while i < profile.completed_scholarships.len() {
+                if let Some(funder) = profile.completed_scholarships.get(i) {
+                    if let Some(stream) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, Stream>(&DataKey::Stream(funder.clone(), student.clone()))
+                    {
+                        if stream.is_active {
+                            env.panic_with_error(AlumniPruneError::PendingMilestone);
+                        }
+                    }
+                }
+                i = i.saturating_add(1);
+            }
+        }
+
+        // 6. Verify there is actually heavy data to prune
+        let has_grant = env
+            .storage()
+            .persistent()
+            .has(&DataKey::GrantMetadata(student.clone()));
+        let has_transcript = env
+            .storage()
+            .persistent()
+            .has(&DataKey::TranscriptEvidence(student.clone()));
+        if !has_grant && !has_transcript {
+            env.panic_with_error(AlumniPruneError::NoHeavyDataToPrune);
+        }
+
+        // 7. Compute diploma hash from graduate profile before deleting heavy data
+        let profile: GraduateProfile = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GraduationRegistry(student.clone()))
+            .unwrap();
+        // Hash the graduation data to produce a lightweight audit proof
+        let diploma_hash = env.crypto().sha256(
+            &soroban_sdk::Bytes::from_slice(
+                &env,
+                &{
+                    let mut buf: [u8; 40] = [0u8; 40];
+                    let ts_bytes = profile.graduation_date.to_be_bytes();
+                    let gpa_bytes = profile.final_gpa.to_be_bytes();
+                    buf[..8].copy_from_slice(&ts_bytes);
+                    buf[8..16].copy_from_slice(&gpa_bytes);
+                    // Include a domain separator to prevent collisions
+                    buf[16..24].copy_from_slice(b"DIPLOMA_");
+                    buf
+                },
+            ),
+        );
+
+        // 8. Delete heavy grant metadata
+        if has_grant {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::GrantMetadata(student.clone()));
+        }
+
+        // 9. Delete heavy transcript evidence
+        if has_transcript {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::TranscriptEvidence(student.clone()));
+        }
+
+        // 10. Store lightweight diploma hash for future audit
+        env.storage()
+            .persistent()
+            .set(&DataKey::DiplomaHash(student.clone()), &diploma_hash);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DiplomaHash(student.clone()),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+
+        // 11. Calculate gas bounty for relayer (5% of estimated reclaimed rent)
+        // Estimate reclaimed rent as a function of the data size removed
+        let estimated_reclaimed_stroops: i128 = if has_grant && has_transcript {
+            200_0000000 // ~200 XLM estimated rent for both heavy entries
+        } else {
+            100_0000000 // ~100 XLM for single entry
+        };
+        let bounty = safe_math::div_i128(
+            &env,
+            safe_math::mul_i128(&env, estimated_reclaimed_stroops, ALUMNI_PRUNE_BOUNTY_BPS as i128),
+            10000,
+        );
+
+        // 12. Emit prune receipt
+        let receipt = AlumniPruneReceipt {
+            student: student.clone(),
+            relayer: relayer.clone(),
+            diploma_hash: diploma_hash.clone(),
+            pruned_at: current_time,
+            bounty_stroops: bounty,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::AlumniPruneReceipt(student.clone()), &receipt);
+
+        // 13. Transfer bounty to relayer if possible
+        if let Some(sch) = &scholarship {
+            if bounty > 0 {
+                let token_client = token::Client::new(&env, &sch.token);
+                // Only transfer if contract has balance; bounty is best-effort
+                if token_client.balance(&env.current_contract_address()) >= bounty {
+                    token_client.transfer(&env.current_contract_address(), &relayer, &bounty);
+                }
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "AlumniStatePruned"), student.clone()),
+            (relayer, diploma_hash, bounty),
+        );
+
+        receipt
+    }
+
+    /// Read the lightweight diploma hash for a pruned alumni (audit verification).
+    pub fn get_diploma_hash(env: Env, student: Address) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DiplomaHash(student))
+    }
+
+    /// Read the alumni prune receipt for a student.
+    pub fn get_alumni_prune_receipt(env: Env, student: Address) -> Option<AlumniPruneReceipt> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AlumniPruneReceipt(student))
     }
 
     // --- Issue #115: Emergency_Protocol_Pause_for_University_Admins ---
@@ -2784,6 +3426,9 @@ impl ScholarContract {
         reason: Symbol,
     ) {
         university_admin.require_auth();
+
+        // Validate reason symbol
+        validate_symbol_or_panic(&env, &reason, "security_hold_reason");
         let registered_admin: Address = env
             .storage()
             .persistent()
@@ -3085,8 +3730,95 @@ impl ScholarContract {
             .remove(&DataKey::UnlockTime(student.clone()));
     }
 
+    /// Rate limiting helper function to check if a student can make a claim
+    /// 
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `student` - The student address attempting to claim
+    /// * `rate_limit_key` - The storage key for rate limit data
+    /// * `window_seconds` - The time window for rate limiting (in seconds)
+    /// * `max_attempts` - Maximum allowed attempts in the window
+    /// 
+    /// # Returns
+    /// * `Ok(())` if the claim is allowed
+    /// * `Err(RateLimitError)` if the rate limit is exceeded
+    fn check_rate_limit(
+        env: &Env,
+        student: &Address,
+        rate_limit_key: DataKey,
+        window_seconds: u64,
+        max_attempts: u32,
+    ) -> Result<(), RateLimitError> {
+        let current_time = env.ledger().timestamp();
+        
+        // Try to get existing rate limit info
+        if let Some(mut rate_info) = env.storage().instance().get::<DataKey, RateLimitInfo>(&rate_limit_key) {
+            // Check if the current window has expired
+            if current_time >= rate_info.window_start + window_seconds {
+                // Window expired, reset counters
+                rate_info.window_start = current_time;
+                rate_info.claim_count = 1;
+                rate_info.last_claim_time = current_time;
+            } else {
+                // Still within the current window
+                if rate_info.claim_count >= max_attempts {
+                    return Err(RateLimitError::RateLimitExceeded);
+                }
+                rate_info.claim_count += 1;
+                rate_info.last_claim_time = current_time;
+            }
+            
+            // Update the rate limit info
+            env.storage().instance().set(&rate_limit_key, &rate_info);
+        } else {
+            // No existing rate limit info, create new entry
+            let rate_info = RateLimitInfo {
+                last_claim_time: current_time,
+                claim_count: 1,
+                window_start: current_time,
+            };
+            env.storage().instance().set(&rate_limit_key, &rate_info);
+        }
+        
+        Ok(())
+    }
+
+    /// Admin function to reset rate limits for a student (emergency use)
+    /// 
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - The admin address (must be contract admin)
+    /// * `student` - The student address to reset rate limits for
+    pub fn reset_student_rate_limits(env: Env, admin: Address, student: Address) {
+        // Verify admin authorization
+        let contract_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != contract_admin {
+            env.panic_with_error(ScholarErr::Unauthorized);
+        }
+        
+        // Remove all rate limit entries for the student
+        env.storage().instance().remove(&DataKey::ClaimRateLimit(student.clone()));
+        env.storage().instance().remove(&DataKey::PrivateClaimRateLimit(student.clone()));
+        env.storage().instance().remove(&DataKey::FinalReleaseRateLimit(student));
+    }
+
     pub fn claim_scholarship(env: Env, student: Address, amount: i128) {
         student.require_auth();
+
+        // Check rate limits before processing claim
+        if let Err(rate_error) = Self::check_rate_limit(
+            &env,
+            &student,
+            DataKey::ClaimRateLimit(student.clone()),
+            CLAIM_RATE_LIMIT_WINDOW,
+            CLAIM_RATE_LIMIT_MAX_ATTEMPTS,
+        ) {
+            env.panic_with_error(rate_error);
+        }
 
         let payout_address: Address = env
             .storage()
@@ -3112,6 +3844,16 @@ impl ScholarContract {
 
         let client = token::Client::new(&env, &scholarship.token);
         client.transfer(&env.current_contract_address(), &payout_address, &amount);
+
+        // Auto_Rent_Deduction hook: extend contract instance TTL on every
+        // successful claim if TTL is below the 6-month safety threshold.
+        auto_rent_deduction(
+            &env,
+            &payout_address,
+            amount,
+            &scholarship.token,
+            scholarship.is_native,
+        );
     }
 
     /// # Privacy-Preserving Claim Logic (ZK-Readiness)
@@ -3124,6 +3866,17 @@ impl ScholarContract {
         zk_proof: ZKClaimProof,
     ) {
         student.require_auth();
+
+        // Check rate limits before processing claim (more restrictive for private claims)
+        if let Err(rate_error) = Self::check_rate_limit(
+            &env,
+            &student,
+            DataKey::PrivateClaimRateLimit(student.clone()),
+            PRIVATE_CLAIM_RATE_LIMIT_WINDOW,
+            PRIVATE_CLAIM_RATE_LIMIT_MAX_ATTEMPTS,
+        ) {
+            env.panic_with_error(rate_error);
+        }
 
         // 1. Verify Nullifier has not been used before (Prevent double-claiming)
         let nullifier_key = DataKey::Nullifier(zk_proof.nullifier.clone());
@@ -5651,21 +6404,9 @@ impl ScholarContract {
             ));
         }
 
-        // Validate evidence hash is not empty
-        if payload.evidence_hash.is_empty() {
-            env.panic_with_error((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidAction,
-            ));
-        }
-
-        // Validate reason is not empty
-        if payload.reason.is_empty() {
-            env.panic_with_error((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidAction,
-            ));
-        }
+        // Validate evidence hash and reason with comprehensive checks
+        validate_bytes_or_panic(env, &payload.evidence_hash, "disciplinary_evidence_hash");
+        validate_bytes_or_panic(env, &payload.reason, "disciplinary_reason");
 
         // Validate oracle signatures (simplified check)
         let threshold: u32 = env
@@ -5868,6 +6609,19 @@ impl ScholarContract {
             .instance()
             .get(&DataKey::OracleMultiSigThreshold);
         (oracle, threshold)
+    }
+
+    /// Returns the Unix timestamp of the last automatic rent extension triggered
+    /// by the Auto_Rent_Deduction hook, or 0 if the hook has never fired.
+    /// Useful for off-chain monitoring dashboards and university infrastructure alerts.
+    pub fn get_rent_last_extended(env: Env) -> u64 {
+        last_rent_extended(&env)
+    }
+
+    /// Returns the current contract instance TTL in ledgers.
+    /// Useful for off-chain monitoring to verify the auto-rent hook is working.
+    pub fn get_instance_ttl(env: Env) -> u32 {
+        env.storage().instance().get_ttl()
     }
 
     // Issue #182: SEP-12 AML/KYC Gating for Mega-Donors
